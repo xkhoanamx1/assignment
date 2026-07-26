@@ -15,21 +15,25 @@ export async function POST(req: NextRequest) {
 
   const prompt = `You are a logistics analytics assistant. Always respond with JSON: {"answer": string, "explanation": string, "suggested_chart": string, "filters": string[]}. User question: ${question}`;
 
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }]
-    })
-  });
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }]
+      })
+    });
 
-  const data = await response.json();
+    const data = await response.json();
 
-  if (!response.ok) {
-    return Response.json({ ok: false, error: data.error?.message || 'Gemini request failed.' });
+    if (!response.ok) {
+      return Response.json({ ok: false, error: data.error?.message || 'Gemini request failed.', status: response.status });
+    }
+
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+    return Response.json({ ok: true, raw: text });
+  } catch (error) {
+    return Response.json({ ok: false, error: error instanceof Error ? error.message : 'Unknown error' });
   }
-
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-  return Response.json({ ok: true, raw: text });
 }
