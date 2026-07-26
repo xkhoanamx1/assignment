@@ -65,8 +65,28 @@ function parseCsv(content: string) {
 }
 
 async function loadOrders(): Promise<OrderRow[]> {
-  const csvPath = path.join(process.cwd(), 'data', 'mock_logistics_data.csv');
-  const content = await fs.readFile(csvPath, 'utf8');
+  const candidates = [
+    path.join(process.cwd(), 'data', 'mock_logistics_data.csv'),
+    path.join(process.cwd(), 'mock_logistics_data.csv'),
+    path.join(process.cwd(), '..', 'data', 'mock_logistics_data.csv'),
+    path.join(process.cwd(), '..', 'mock_logistics_data.csv'),
+    path.join(process.cwd(), 'app', 'api', 'query', 'mock_logistics_data.csv')
+  ];
+
+  let content = '';
+  for (const candidate of candidates) {
+    try {
+      content = await fs.readFile(candidate, 'utf8');
+      break;
+    } catch {
+      // continue to next candidate
+    }
+  }
+
+  if (!content) {
+    throw new Error('Unable to locate mock_logistics_data.csv in the deployed environment.');
+  }
+
   const rows = parseCsv(content);
   const headers = rows[0] || [];
 
