@@ -1,10 +1,27 @@
 import { NextRequest } from 'next/server';
 
+function parseJsonResponse(raw: string) {
+  const match = raw.match(/```json\s*([\s\S]*?)\s*```/i) || raw.match(/```([\s\S]*?)```/i);
+  const candidate = match ? match[1] : raw;
+
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    return {
+      answer: raw,
+      explanation: 'The model returned a non-JSON response.',
+      suggested_chart: 'None',
+      filters: {},
+      data: []
+    };
+  }
+}
+
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({ question: '' }));
   const { question } = body;
   const groqKey = process.env.GROQ_API_KEY?.trim();
-  const prompt = `You are a logistics analytics assistant. Respond with a valid JSON object containing answer, explanation, suggested_chart, and filters. User question: ${question}`;
+  const prompt = `You are a logistics analytics assistant. Use the dataset schema from mock_logistics_data.csv. Return only a valid JSON object with fields: answer, explanation, suggested_chart, filters, data. The answer should be concise and based on the logistics dataset. User question: ${question}`;
 
   if (!groqKey) {
     return Response.json(
@@ -48,7 +65,9 @@ export async function POST(req: NextRequest) {
     }
 
     const text = data.choices?.[0]?.message?.content || '';
-    return Response.json({ ok: true, provider: 'groq', raw: text });
+    const parsed = parseJsonResponse(text);
+
+    return Response.json({ ok: true, provider: 'groq', result: parsed });
   } catch (error) {
     return Response.json(
       {
