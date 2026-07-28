@@ -24,6 +24,18 @@ type ResultData = {
   suggested_chart: string;
   filters: Record<string, unknown>;
   data: Array<Record<string, unknown>>;
+  metrics?: string[];
+  dimensions?: string[];
+  query_plan?: string;
+  forecast_meta?: {
+    method: string;
+    slope: number;
+    intercept: number;
+    historical_points: number;
+    recommendation_units: number;
+    safety_stock_factor: number;
+    horizon_months: number;
+  };
   dashboard?: DashboardPayload;
   provider?: string;
   prompt_config?: {
@@ -104,8 +116,206 @@ function SimpleBarChart({ data, labelKey, valueKey }: { data: Array<Record<strin
   );
 }
 
-function DynamicResultChart({ data }: { data: Array<Record<string, unknown>> }) {
+function LineChart({ data, xKey, yKey }: { data: Array<Record<string, unknown>>; xKey: string; yKey: string }) {
+  if (!data.length) return <p>No chart data.</p>;
+  const values = data.map((row) => Number(row[yKey] || 0));
+  const maxValue = Math.max(...values, 1);
+  const minValue = Math.min(...values, 0);
+  const range = Math.max(1, maxValue - minValue);
+  const stepX = data.length > 1 ? 400 / (data.length - 1) : 0;
+
+  const path = values
+    .map((value, index) => {
+      const x = 40 + index * stepX;
+      const y = 180 - ((value - minValue) / range) * 140;
+      return `${index === 0 ? 'M' : 'L'} ${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(' ');
+
+  return (
+    <svg viewBox="0 0 480 220" className="chart">
+      <line x1="20" y1="180" x2="460" y2="180" stroke="#64748b" />
+      <line x1="20" y1="20" x2="20" y2="180" stroke="#64748b" />
+      <path fill="none" stroke="#38bdf8" strokeWidth="2" d={path} />
+      {data.map((row, index) => {
+        const value = Number(row[yKey] || 0);
+        const x = 40 + index * stepX;
+        const y = 180 - ((value - minValue) / range) * 140;
+        const isForecast = row[yKey] === null || row[yKey] === undefined;
+        return (
+          <g key={`${row[xKey]}-${index}`}>
+            <circle cx={x} cy={y} r="4" fill={isForecast ? '#f59e0b' : '#f8fafc'} stroke={isForecast ? '#f59e0b' : '#38bdf8'} strokeWidth="2" />
+            <text x={x} y="200" textAnchor="middle" fontSize="9" fill="#94a3b8">
+              {String(row[xKey] ?? '').slice(0, 7)}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+function ForecastChart({ data }: { data: Array<Record<string, unknown>> }) {
+  if (!data.length) return <p>No chart data.</p>;
+
+  const allValues = data.flatMap((row) => {
+    const cells: number[] = [];
+    if (row.historical !== null && row.historical !== undefined) cells.push(Number(row.historical));
+    if (row.forecast !== null && row.forecast !== undefined) cells.push(Number(row.forecast));
+    return cells;
+  });
+  const maxValue = Math.max(1, ...allValues);
+  const minValue = Math.min(0, ...allValues);
+  const range = Math.max(1, maxValue - minValue);
+  const stepX = data.length > 1 ? 400 / (data.length - 1) : 0;
+
+  const xAt = (index: number) => 40 + index * stepX;
+  const yAt = (value: number) => 180 - ((value - minValue) / range) * 140;
+
+  const histPoints: Array<{ x: number; y: number }> = [];
+  const forecastPoints: Array<{ x: number; y: number }> = [];
+  data.forEach((row, index) => {
+    if (row.historical !== null && row.historical !== undefined) {
+      histPoints.push({ x: xAt(index), y: yAt(Number(row.historical)) });
+    }
+    if (row.forecast !== null && row.forecast !== undefined) {
+      forecastPoints.push({ x: xAt(index), y: yAt(Number(row.forecast)) });
+    }
+  });
+
+  const histPath = histPoints.map((pt, i) => `${i === 0 ? 'M' : 'L'} ${pt.x.toFixed(1)},${pt.y.toFixed(1)}`).join(' ');
+  const forecastPath = forecastPoints
+    .map((pt, i) => `${i === 0 ? 'M' : 'L'} ${pt.x.toFixed(1)},${pt.y.toFixed(1)}`)
+    .join(' ');
+
+  const bridgePoint = histPoints.length && forecastPoints.length
+    ? `M ${histPoints[histPoints.length - 1].x.toFixed(1)},${histPoints[histPoints.length - 1].y.toFixed(1)} L ${forecastPoints[0].x.toFixed(1)},${forecastPoints[0].y.toFixed(1)}`
+    : '';
+
+  return (
+    <svg viewBox="0 0 480 220" className="chart">
+      <line x1="20" y1="180" x2="460" y2="180" stroke="#64748b" />
+      <line x1="20" y1="20" x2="20" y2="180" stroke="#64748b" />
+      {histPoints.map((pt, i) => (
+        <circle key={`h-${i}`} cx={pt.x} cy={pt.y} r="4" fill="#38bdf8" />
+      ))}
+      {forecastPoints.map((pt, i) => (
+        <circle key={`f-${i}`} cx={pt.x} cy={pt.y} r="4" fill="#f59e0b" />
+      ))}
+      {histPath ? <path fill="none" stroke="#38bdf8" strokeWidth="2" d={histPath} /> : null}
+      {bridgePoint ? <path fill="none" stroke="#94a3b8" strokeWidth="1.5" strokeDasharray="4 3" d={bridgePoint} /> : null}
+      {forecastPath ? <path fill="none" stroke="#f59e0b" strokeWidth="2" strokeDasharray="6 4" d={forecastPath} /> : null}
+      {data.map((row, index) => (
+        <text key={`lbl-${index}`} x={xAt(index)} y="200" textAnchor="middle" fontSize="9" fill="#94a3b8">
+          {String(row.month ?? '').slice(2)}
+        </text>
+      ))}
+    </svg>
+  );
+}
+
+function KpiCard({ data }: { data: Array<Record<string, unknown>> }) {
+  if (!data.length) return <p>No KPI data.</p>;
+  const first = data[0];
+  const entries = Object.entries(first).filter(([, value]) => typeof value === 'number' || (typeof value === 'string' && value.trim() !== '' && Number.isNaN(Number(value)) === false));
+  const display = entries.length ? entries : Object.entries(first).slice(0, 2);
+
+  return (
+    <div className="grid">
+      {display.map(([key, value]) => (
+        <div key={key} className="metric-card">
+          <p>{key.replace(/_/g, ' ')}</p>
+          <strong>{typeof value === 'number' ? value.toLocaleString() : String(value)}</strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DataTable({ data }: { data: Array<Record<string, unknown>> }) {
+  if (!data.length) return <p>No table data.</p>;
+  const first = data[0];
+  const keys = Array.from(
+    data.reduce((set, row) => {
+      Object.keys(row).forEach((k) => set.add(k));
+      return set;
+    }, new Set<string>())
+  ).slice(0, 8);
+
+  return (
+    <div className="result-block">
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.9rem' }}>
+        <thead>
+          <tr>
+            {keys.map((key) => (
+              <th key={key} style={{ textAlign: 'left', padding: '8px', borderBottom: '1px solid #1e293b', color: '#94a3b8' }}>
+                {key}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {data.map((row, idx) => (
+            <tr key={idx}>
+              {keys.map((key) => (
+                <td key={`${idx}-${key}`} style={{ padding: '8px', borderBottom: '1px solid #1e293b' }}>
+                  {row[key] === null || row[key] === undefined ? '—' : String(row[key])}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ScatterChart({ data, xKey, yKey }: { data: Array<Record<string, unknown>>; xKey: string; yKey: string }) {
+  if (!data.length) return <p>No scatter data.</p>;
+  const xs = data.map((row) => Number(row[xKey] || 0));
+  const ys = data.map((row) => Number(row[yKey] || 0));
+  const maxX = Math.max(1, ...xs);
+  const maxY = Math.max(1, ...ys);
+
+  return (
+    <svg viewBox="0 0 480 220" className="chart">
+      <line x1="20" y1="180" x2="460" y2="180" stroke="#64748b" />
+      <line x1="20" y1="20" x2="20" y2="180" stroke="#64748b" />
+      {data.map((row, index) => {
+        const x = 20 + (Number(row[xKey] || 0) / maxX) * 420;
+        const y = 180 - (Number(row[yKey] || 0) / maxY) * 140;
+        return <circle key={`${index}`} cx={x} cy={y} r="5" fill="#a78bfa" opacity="0.7" />;
+      })}
+    </svg>
+  );
+}
+
+function DynamicResultChart({ data, suggestedChart }: { data: Array<Record<string, unknown>>; suggestedChart: string }) {
   if (!data.length) return null;
+  const chartType = (suggestedChart || '').toLowerCase();
+
+  if (chartType.includes('line') || data.some((row) => 'forecast' in row || 'historical' in row)) {
+    if (data.some((row) => 'forecast' in row || 'historical' in row)) {
+      return <ForecastChart data={data} />;
+    }
+    const xKey = Object.keys(data[0]).find((k) => /month|week|date|label|name|day/i.test(k)) || Object.keys(data[0])[0];
+    const yKey = Object.keys(data[0]).find((k) => /count|orders|rate|value|quantity|total|amount|forecast/i.test(k)) || Object.keys(data[0])[1] || 'value';
+    return <LineChart data={data} xKey={xKey} yKey={yKey} />;
+  }
+
+  if (chartType.includes('kpi') || data.length <= 1) {
+    return <KpiCard data={data} />;
+  }
+
+  if (chartType.includes('table')) {
+    return <DataTable data={data} />;
+  }
+
+  if (chartType.includes('scatter')) {
+    const xKey = Object.keys(data[0])[0] || 'x';
+    const yKey = Object.keys(data[0]).find((k) => k !== xKey) || 'y';
+    return <ScatterChart data={data} xKey={xKey} yKey={yKey} />;
+  }
 
   const first = data[0];
   const metricKey = Object.keys(first).find((key) => /count|orders|rate|value|cost|amount|total|delay/i.test(key)) || Object.keys(first)[1] || 'value';
@@ -352,12 +562,27 @@ export default function HomePage() {
             <p><strong>Answer:</strong> {result.answer}</p>
             <p><strong>Explanation:</strong> {result.explanation}</p>
             <p><strong>Suggested chart:</strong> {result.suggested_chart}</p>
-            <p><strong>Filters:</strong> {JSON.stringify(result.filters || {}, null, 2)}</p>
+            <p><strong>Filters:</strong> <code>{JSON.stringify(result.filters || {}, null, 2)}</code></p>
+            {result.metrics && result.metrics.length ? (
+              <p><strong>Metrics:</strong> {result.metrics.join(', ')}</p>
+            ) : null}
+            {result.dimensions && result.dimensions.length ? (
+              <p><strong>Dimensions:</strong> {result.dimensions.join(', ')}</p>
+            ) : null}
+            {result.query_plan ? (
+              <p><strong>Query plan:</strong> {result.query_plan}</p>
+            ) : null}
+            {result.forecast_meta ? (
+              <div className="result-block">
+                <strong>Forecast metadata:</strong>
+                <pre>{JSON.stringify(result.forecast_meta, null, 2)}</pre>
+              </div>
+            ) : null}
             <p><strong>Provider:</strong> {result.provider || 'csv-rule'}</p>
             {result.data && result.data.length > 0 ? (
               <div className="result-block">
                 <strong>Chart:</strong>
-                <DynamicResultChart data={result.data} />
+                <DynamicResultChart data={result.data} suggestedChart={result.suggested_chart} />
                 <pre>{JSON.stringify(result.data, null, 2)}</pre>
               </div>
             ) : null}

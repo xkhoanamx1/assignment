@@ -1,28 +1,30 @@
-# Logistics Gemini Demo
+# `web/` — legacy prototype (NOT the canonical source)
 
-This is a simple Vercel-ready demo for a logistics analytics assistant.
+The canonical Next.js application lives at the repository root in `app/`. This `web/` directory is an earlier Gemini-only prototype kept for historical reference only.
 
-## Environment variables
+## Why is this archived?
 
-Set the following in Vercel:
+The root `app/` build contains:
 
-- GEMINI_API_KEY=your_google_gemini_api_key
+- The full rule-based analytics engine covering 10 reference Q&A pairs.
+- The Forecasting Tool (linear regression / moving average + inventory recommendation).
+- Explainability fields (`metrics`, `dimensions`, `query_plan`) on every response.
+- Dynamic chart selection (Bar / Line / KPI / Table / Scatter).
+- A documented LLM fallback chain (`groq → gemini`).
+- A comprehensive `README.md` covering setup, architecture, and limitations.
 
-## Local development
+This `web/` prototype predates those features and is **not** the deploy target. The plan is to remove it once the canonical build is stable; see `README.md` → *Future Improvements → Deprecate `web/`*.
+
+## If you still need to run this prototype
 
 ```bash
+cd web
 npm install
 npm run dev
 ```
 
-## Demo test cases
+The prototype only supports the Gemini provider and exposes a subset of the questions. Tests that depend on forecasting or on the explainability fields will fail here.
 
-1. "Show delayed orders by week for the last 3 months"
-2. "Which carrier has the highest delay rate?"
-3. "How many orders were delivered late last month?"
-4. "Predict demand for SKU PAPER-0197 for the next 4 months"
-5. "How much inventory should I plan?"
+## For the real project
 
-Expected behavior:
-- The app should route the query to the appropriate analytics or forecasting handler.
-- The response should include an answer, explanation, suggested chart, and filters.
+Read [`../README.md`](../README.md).

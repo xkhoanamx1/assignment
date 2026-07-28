@@ -5,10 +5,14 @@
  * Contract:
  *  - resolveConfig() honours ANALYTICS_PROVIDER (rule-based / groq / gemini / auto / invalid).
  *  - When provider is groq/gemini/auto, the configured LLM endpoint is hit.
- *  - LLM output is the PRIMARY answer. The rule-based answer is preserved as a reference
- *    in prompt_config.rule_based_answer so the user can compare.
+ *  - The rule-based engine is the verified source of truth. The LLM only
+ *    contributes the qualitative explanation; it can NEVER replace the
+ *    computed `answer` (the model does not see the full CSV and would
+ *    otherwise hallucinate numbers).
  *  - When the LLM fails or returns nothing, the response falls back to csv-rule cleanly.
- *  - When the LLM returns JSON, the parsed answer/explanation/filters/data replace defaults.
+ *  - When the LLM returns parseable JSON, the parsed explanation/suggested_chart/
+ *    filters/data are merged onto the rule-based result; rule_based_answer is
+ *    preserved as a reference.
  *
  * No real API calls are made.
  */
@@ -95,7 +99,8 @@ async function expectOk(name: string, condition: boolean) {
   await expectOk('rule-based: provider = csv-rule', ruleBased.provider === 'csv-rule');
   await expectOk('rule-based: answer is the rule-based summary', /highest delay rate is USPS at 26\.7%/.test(ruleBased.result?.answer ?? ''));
 
-  // 2. groq (plain text): answer comes from LLM, rule-based saved as reference.
+  // 2. groq (plain text): the rule-based answer remains the answer; LLM text
+  // is parsed only if it is valid JSON, otherwise the rule-based answer wins.
   fetchedUrls = [];
   const groqResult = await runCase('groq', async (url) => {
     fetchedUrls.push(url);
@@ -109,10 +114,11 @@ async function expectOk(name: string, condition: boolean) {
   });
   await expectOk('groq: hits api.groq.com', fetchedUrls.some((u) => u.includes('api.groq.com')));
   await expectOk('groq: provider = groq', groqResult.provider === 'groq');
-  await expectOk('groq: LLM text is the primary answer', groqResult.result?.answer === groqPlainText);
+  await expectOk('groq: rule-based answer wins when LLM text is not JSON', /highest delay rate is USPS at 26\.7%/.test(groqResult.result?.answer ?? ''));
   await expectOk('groq: rule-based answer is preserved as reference', /highest delay rate is USPS at 26\.7%/.test(groqResult.prompt_config?.rule_based_answer ?? ''));
 
-  // 3. groq (structured JSON): parsed answer/explanation/filters/data replace defaults.
+  // 3. groq (structured JSON): explanation/suggested_chart/filters/data come
+  // from the parsed JSON, but `answer` is still the rule-based answer.
   fetchedUrls = [];
   const groqJsonResult = await runCase('groq', async (url) => {
     fetchedUrls.push(url);
@@ -124,12 +130,12 @@ async function expectOk(name: string, condition: boolean) {
     }
     return new Response('{}', { status: 500 });
   });
-  await expectOk('groq JSON: answer comes from parsed JSON', groqJsonResult.result?.answer === 'Groq JSON: USPS is the slowest at 26.7%.');
+  await expectOk('groq JSON: rule-based answer wins over LLM answer', /highest delay rate is USPS at 26\.7%/.test(groqJsonResult.result?.answer ?? ''));
   await expectOk('groq JSON: explanation comes from parsed JSON', /Computed by Groq/.test(groqJsonResult.result?.explanation ?? ''));
   await expectOk('groq JSON: suggested_chart comes from parsed JSON', groqJsonResult.result?.suggested_chart === 'Line chart');
   await expectOk('groq JSON: data comes from parsed JSON', Array.isArray(groqJsonResult.result?.data) && groqJsonResult.result?.data[0]?.carrier === 'USPS');
 
-  // 4. gemini: hits generativelanguage.googleapis.com; answer is the LLM text.
+  // 4. gemini: hits generativelanguage.googleapis.com; answer stays rule-based.
   fetchedUrls = [];
   const geminiResult = await runCase('gemini', async (url) => {
     fetchedUrls.push(url);
@@ -143,7 +149,7 @@ async function expectOk(name: string, condition: boolean) {
   });
   await expectOk('gemini: hits Gemini endpoint', fetchedUrls.some((u) => u.includes('generativelanguage.googleapis.com')));
   await expectOk('gemini: provider = gemini', geminiResult.provider === 'gemini');
-  await expectOk('gemini: LLM text is the primary answer', geminiResult.result?.answer === geminiPlainText);
+  await expectOk('gemini: rule-based answer wins when LLM text is not JSON', /highest delay rate is USPS at 26\.7%/.test(geminiResult.result?.answer ?? ''));
 
   // 5. auto with GROQ key set: prefers Groq.
   fetchedUrls = [];

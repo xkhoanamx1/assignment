@@ -12,6 +12,19 @@ type OrderRow = {
   order_value_usd: number;
   region: string;
   is_promo: string;
+  sku: string;
+  product_category: string;
+  quantity: number;
+};
+
+type ForecastMeta = {
+  method: 'linear_regression' | 'moving_average';
+  slope: number;
+  intercept: number;
+  historical_points: number;
+  recommendation_units: number;
+  safety_stock_factor: number;
+  horizon_months: number;
 };
 
 type AnalyticsResult = {
@@ -20,6 +33,10 @@ type AnalyticsResult = {
   suggested_chart: string;
   filters: Record<string, string | number | boolean>;
   data: Array<Record<string, unknown>>;
+  metrics?: string[];
+  dimensions?: string[];
+  query_plan?: string;
+  forecast_meta?: ForecastMeta;
   dashboard?: {
     summary: {
       total_orders: number;
@@ -180,7 +197,10 @@ async function loadOrders(): Promise<OrderRow[]> {
       destination_city: String(record.destination_city || ''),
       order_value_usd: Number(record.order_value_usd || 0),
       region: String(record.region || ''),
-      is_promo: String(record.is_promo || '0')
+      is_promo: String(record.is_promo || '0'),
+      sku: String(record.sku || ''),
+      product_category: String(record.product_category || ''),
+      quantity: Number(record.quantity || 0)
     };
   });
 }
@@ -326,7 +346,10 @@ function buildDelayedByWeekResult(question: string, orders: OrderRow[]): Analyti
       : 'This chart groups delayed orders by week so you can see the trend and weekly peaks.',
     suggested_chart: 'Bar chart',
     filters: { time_range: 'last_3_months', status: 'delayed', group_by: 'week' },
-    data
+    data,
+    metrics: ['delayed_orders'],
+    dimensions: ['week'],
+    query_plan: 'filter status=delayed (last 3 months) → group by ISO week → count orders'
   };
 }
 
@@ -365,7 +388,10 @@ function buildCarrierDelayResult(question: string, orders: OrderRow[]): Analytic
       : 'Delay rate is calculated as delayed orders divided by total orders for each carrier.',
     suggested_chart: 'Bar chart',
     filters: { time_range: 'last_3_months', metric: 'delay_rate', group_by: 'carrier' },
-    data
+    data,
+    metrics: ['delay_rate', 'total_orders', 'delayed_orders'],
+    dimensions: ['carrier'],
+    query_plan: 'filter last 3 months → group by carrier → count delayed / total → compute delay_rate → sort desc'
   };
 }
 
@@ -395,7 +421,10 @@ function buildRouteCostResult(question: string, orders: OrderRow[]): AnalyticsRe
       : 'This route is ranked by the sum of order value from the actual CSV data.',
     suggested_chart: 'Bar chart',
     filters: { time_range: 'last_3_months', metric: 'order_value_usd', group_by: 'route' },
-    data
+    data,
+    metrics: ['total_order_value_usd'],
+    dimensions: ['route'],
+    query_plan: 'filter last 3 months → group by origin_city → destination_city → sum order_value_usd → sort desc'
   };
 }
 
@@ -409,7 +438,10 @@ function buildLastMonthDelayedResult(question: string, orders: OrderRow[]): Anal
       explanation: locale === 'vi' ? 'Không thể xác định tháng gần nhất.' : 'Unable to determine the latest calendar month.',
       suggested_chart: 'KPI card',
       filters: { time_range: 'latest_month', status: 'delayed' },
-      data: []
+      data: [],
+      metrics: ['delayed_orders'],
+      dimensions: ['month'],
+      query_plan: 'pick max(order_date) → use its calendar month → filter status=delayed → count'
     };
   }
 
@@ -427,7 +459,10 @@ function buildLastMonthDelayedResult(question: string, orders: OrderRow[]): Anal
         : 'Counts orders with status=delayed in the calendar month of the latest order_date in the CSV.',
     suggested_chart: 'KPI card',
     filters: { time_range: monthLabel, status: 'delayed', metric: 'delayed_count' },
-    data: [{ month: monthLabel, delayed_orders: delayed, total_orders: monthOrders.length }]
+    data: [{ month: monthLabel, delayed_orders: delayed, total_orders: monthOrders.length }],
+    metrics: ['delayed_orders', 'total_orders'],
+    dimensions: ['month'],
+    query_plan: 'identify latest month from max(order_date) → filter status=delayed → count'
   };
 }
 
@@ -448,7 +483,10 @@ function buildExceptionCountResult(question: string, orders: OrderRow[]): Analyt
         : 'Filters by order_date in the last 3 months and counts status=exception.',
     suggested_chart: 'KPI card',
     filters: { time_range: 'last_3_months', status: 'exception', metric: 'order_count' },
-    data: [{ status: 'exception', count }]
+    data: [{ status: 'exception', count }],
+    metrics: ['order_count'],
+    dimensions: ['status'],
+    query_plan: 'filter order_date in last 3 months → filter status=exception → count'
   };
 }
 
@@ -468,7 +506,10 @@ function buildInTransitResult(question: string, orders: OrderRow[]): AnalyticsRe
         : 'Filters by order_date in the last 3 months and counts status=in_transit.',
     suggested_chart: 'KPI card',
     filters: { time_range: 'last_3_months', status: 'in_transit', metric: 'order_count' },
-    data: [{ status: 'in_transit', count }]
+    data: [{ status: 'in_transit', count }],
+    metrics: ['order_count'],
+    dimensions: ['status'],
+    query_plan: 'filter order_date in last 3 months → filter status=in_transit → count'
   };
 }
 
@@ -499,7 +540,142 @@ function buildAvgDeliveryResult(question: string, orders: OrderRow[]): Analytics
         : 'Computes days between order_date and delivery_date, then averages across qualifying orders.',
     suggested_chart: 'KPI card',
     filters: { time_range: 'last_3_months', metric: 'avg_delivery_days' },
-    data: [{ avg_delivery_days: avg, sample_size: deliveryDays.length }]
+    data: [{ avg_delivery_days: avg, sample_size: deliveryDays.length }],
+    metrics: ['avg_delivery_days', 'sample_size'],
+    dimensions: [],
+    query_plan: 'filter last 3 months → compute (delivery_date - order_date) in days → average'
+  };
+}
+
+function buildForecastResult(question: string, orders: OrderRow[]): AnalyticsResult {
+  const locale = isVietnamese(question) ? 'vi' : 'en';
+  const horizonMatch = question.match(/(\d+)\s*(month|tháng|months|month)\b/i);
+  const horizon = horizonMatch ? Math.max(1, Math.min(12, Number(horizonMatch[1]))) : 4;
+  const safetyStockFactor = 1.2;
+
+  const skuMatch = question.match(/SKU[- ]?([A-Z0-9]+-\d+)/i);
+  const sku = skuMatch ? skuMatch[1].toUpperCase() : null;
+
+  const source = sku
+    ? orders.filter((order) => order.sku.toUpperCase() === sku)
+    : orders;
+
+  const monthlyMap = new Map<string, number>();
+  source.forEach((order) => {
+    const date = getSafeDate(order.order_date);
+    if (!date) return;
+    const month = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+    monthlyMap.set(month, (monthlyMap.get(month) || 0) + (order.quantity || 0));
+  });
+
+  const historical = Array.from(monthlyMap.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([month, quantity]) => ({ month, historical: Number(quantity.toFixed(2)), forecast: null as number | null }));
+
+  let method: 'linear_regression' | 'moving_average' = 'linear_regression';
+  let slope = 0;
+  let intercept = 0;
+
+  const quantities = historical.map((row) => Number(row.historical));
+  const lastMonthLabel = historical.length
+    ? historical[historical.length - 1].month
+    : null;
+
+  const forecast: Array<{ month: string; historical: number | null; forecast: number }> = [];
+
+  if (historical.length >= 2) {
+    const n = historical.length;
+    const xs = quantities.map((_, idx) => idx);
+    const meanX = xs.reduce((s, x) => s + x, 0) / n;
+    const meanY = quantities.reduce((s, y) => s + y, 0) / n;
+    let num = 0;
+    let den = 0;
+    for (let i = 0; i < n; i += 1) {
+      num += (xs[i] - meanX) * (quantities[i] - meanY);
+      den += (xs[i] - meanX) ** 2;
+    }
+    slope = den === 0 ? 0 : num / den;
+    intercept = meanY - slope * meanX;
+  } else {
+    method = 'moving_average';
+  }
+
+  const nextMonths = lastMonthLabel
+    ? Array.from({ length: horizon }, (_, i) => {
+        const [yStr, mStr] = lastMonthLabel.split('-');
+        const y = Number(yStr);
+        const m = Number(mStr) - 1;
+        const d = new Date(y, m + i + 1, 1);
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      })
+    : [];
+
+  if (method === 'linear_regression') {
+    const baseIndex = historical.length;
+    nextMonths.forEach((month, i) => {
+      const predicted = Math.max(0, Number((intercept + slope * (baseIndex + i)).toFixed(2)));
+      forecast.push({ month, historical: null, forecast: predicted });
+    });
+  } else {
+    const window = quantities.slice(-3);
+    const avg = window.length ? window.reduce((s, v) => s + v, 0) / window.length : 0;
+    nextMonths.forEach((month) => {
+      forecast.push({ month, historical: null, forecast: Number(avg.toFixed(2)) });
+    });
+  }
+
+  const data = [...historical, ...forecast];
+  const forecastValues = forecast.map((row) => row.forecast);
+  const peakForecast = forecastValues.length ? Math.max(...forecastValues) : 0;
+  const meanForecast = forecastValues.length
+    ? forecastValues.reduce((s, v) => s + v, 0) / forecastValues.length
+    : 0;
+  const recommendationUnits = Math.ceil(meanForecast * safetyStockFactor);
+
+  const scopeLabel = sku
+    ? locale === 'vi' ? `SKU ${sku}` : `SKU ${sku}`
+    : locale === 'vi' ? 'tổng sản phẩm' : 'all SKUs';
+
+  const answer = locale === 'vi'
+    ? `Dự báo nhu cầu cho ${scopeLabel} trong ${horizon} tháng tới: trung bình ${meanForecast.toFixed(1)} đơn vị/tháng, đỉnh ${peakForecast.toFixed(1)} đơn vị. Khuyến nghị tồn kho: ${recommendationUnits} đơn vị (hệ số an toàn ${safetyStockFactor}).`
+    : `Demand forecast for ${scopeLabel} over the next ${horizon} months: average ${meanForecast.toFixed(1)} units/month, peak ${peakForecast.toFixed(1)} units. Inventory recommendation: ${recommendationUnits} units (safety-stock factor ${safetyStockFactor}).`;
+
+  const explanation = locale === 'vi'
+    ? `Tổng quantity theo tháng được hồi quy tuyến tính (${historical.length} điểm lịch sử). Nếu dữ liệu quá ít, hệ thống tự fallback sang moving average 3 tháng. Tồn kho khuyến nghị = mean(forecast) × ${safetyStockFactor} đề phòng biến động.`
+    : `Monthly quantity is linearly regressed on month index (${historical.length} historical points). When fewer than 2 points are available, the method falls back to a 3-month moving average. Inventory recommendation = mean(forecast) × ${safetyStockFactor} to cover demand variability.`;
+
+  const historicalRange = historical.length
+    ? `${historical[0].month} → ${historical[historical.length - 1].month}`
+    : 'none';
+
+  return {
+    answer,
+    explanation,
+    suggested_chart: 'Line chart',
+    filters: {
+      time_range: historicalRange,
+      sku: sku || 'all',
+      horizon_months: horizon,
+      metric: 'quantity',
+      dimension: 'month',
+      safety_stock_factor: safetyStockFactor
+    },
+    data: data as Array<Record<string, unknown>>,
+    metrics: ['quantity', 'forecast_quantity'],
+    dimensions: ['month'],
+    query_plan: sku
+      ? `filter sku=${sku} → group by order_date month → sum quantity → linear regression on (monthIndex, quantity) → forecast next ${horizon} months → recommend inventory = mean(forecast) × ${safetyStockFactor}`
+      : `filter all orders → group by order_date month → sum quantity → linear regression on (monthIndex, quantity) → forecast next ${horizon} months → recommend inventory = mean(forecast) × ${safetyStockFactor}`,
+    forecast_meta: {
+      method,
+      slope: Number(slope.toFixed(4)),
+      intercept: Number(intercept.toFixed(4)),
+      historical_points: historical.length,
+      recommendation_units: recommendationUnits,
+      safety_stock_factor: safetyStockFactor,
+      horizon_months: horizon
+    },
+    provider: 'csv-rule'
   };
 }
 
@@ -529,7 +705,10 @@ function buildTopRegionResult(question: string, orders: OrderRow[]): AnalyticsRe
         : 'Groups by the region column and counts orders in the last 3 months.',
     suggested_chart: 'Bar chart',
     filters: { time_range: 'last_3_months', dimension: 'region', metric: 'order_count' },
-    data: data.slice(0, 5)
+    data: data.slice(0, 5),
+    metrics: ['order_count'],
+    dimensions: ['region'],
+    query_plan: 'filter last 3 months → group by region → count → sort desc → top 5'
   };
 }
 
@@ -549,7 +728,10 @@ function buildPromoOrdersResult(question: string, orders: OrderRow[]): Analytics
         : 'Counts orders with is_promo=1 in the last 3 months window.',
     suggested_chart: 'KPI card',
     filters: { time_range: 'last_3_months', metric: 'promo_orders', is_promo: '1' },
-    data: [{ promo_orders: promo, total_orders: filtered.length }]
+    data: [{ promo_orders: promo, total_orders: filtered.length }],
+    metrics: ['promo_orders', 'total_orders'],
+    dimensions: [],
+    query_plan: 'filter last 3 months → filter is_promo=1 → count'
   };
 }
 
@@ -573,7 +755,10 @@ function buildSummaryResult(question: string, orders: OrderRow[]): AnalyticsResu
     data: [
       { status: 'delivered', count: delivered },
       { status: 'delayed', count: delayed }
-    ]
+    ],
+    metrics: ['order_count', 'on_time_rate'],
+    dimensions: ['status'],
+    query_plan: 'filter last 3 months → group by status → count → compute on-time rate'
   };
 }
 
@@ -588,9 +773,20 @@ function buildAnalyticsResult(question: string, orders: OrderRow[]): AnalyticsRe
       suggested_chart: 'KPI + trend chart',
       filters: { time_range: 'last_3_months' },
       data: dashboard.status_breakdown,
+      metrics: ['total_orders', 'delivered', 'delayed', 'on_time_rate', 'avg_delivery_days'],
+      dimensions: ['status', 'month', 'carrier'],
+      query_plan: 'filter last 3 months → aggregate KPIs (total/delivered/delayed/avg delivery/OTR) → group by month for trend → group by carrier for delay rate',
       dashboard,
       provider: 'csv-rule'
     };
+  }
+
+  if (/(forecast|predict|demand|dự báo|dự đoán)/i.test(q) || /(sku|product|sản phẩm)/i.test(q)) {
+    return buildForecastResult(question, orders);
+  }
+
+  if (/(inventory|tồn kho|stock)/i.test(q)) {
+    return buildForecastResult(question, orders);
   }
 
   if (/(delay|delayed|trễ|trễ hẹn|late)/i.test(q) && /(week|tuần)/i.test(q)) {
@@ -713,18 +909,69 @@ async function tryLlm(question: string, promptTemplate: string, provider: Resolv
   return null;
 }
 
+function stripJsonComments(text: string): string {
+  // Remove // line comments and /* ... */ block comments outside of string literals.
+  // The LLM sometimes leaks JS-style comments into JSON; this rescues those responses
+  // without disturbing valid JSON that contains ":" or "//" inside string values.
+  let result = '';
+  let i = 0;
+  let inString = false;
+  let stringQuote = '';
+  while (i < text.length) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (inString) {
+      result += ch;
+      if (ch === '\\' && i + 1 < text.length) {
+        result += next;
+        i += 2;
+        continue;
+      }
+      if (ch === stringQuote) inString = false;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inString = true;
+      stringQuote = ch;
+      result += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      while (i < text.length && text[i] !== '\n') i += 1;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      i += 2;
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i += 1;
+      i += 2;
+      continue;
+    }
+    result += ch;
+    i += 1;
+  }
+  return result;
+}
+
 function extractFirstJson(text: string): Record<string, unknown> | null {
   const trimmed = text.trim();
   const direct = trimmed.startsWith('{') ? trimmed : null;
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const candidate = direct || (fenced ? fenced[1].trim() : null);
   if (!candidate) return null;
-  try {
-    const parsed = JSON.parse(candidate);
-    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
-  } catch {
-    return null;
+  const attempts = [candidate, stripJsonComments(candidate)];
+  for (const attempt of attempts) {
+    try {
+      const parsed = JSON.parse(attempt);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // try next attempt
+    }
   }
+  return null;
 }
 
 function summarizeLlmText(text: string): string {
@@ -800,32 +1047,65 @@ export async function POST(req: NextRequest) {
     let primaryResult: AnalyticsResult;
     if (llmUsed) {
       const parsed = extractFirstJson(llmText!);
-      primaryResult = {
-        ...baseResult,
-        answer: typeof parsed?.answer === 'string' && parsed.answer.trim()
-          ? parsed.answer.trim()
-          : summarizeLlmText(llmText!),
-        explanation: typeof parsed?.explanation === 'string' && parsed.explanation.trim()
-          ? parsed.explanation.trim()
-          : `Answered by ${effectiveProvider} using the configured logistics prompt.`,
-        suggested_chart: typeof parsed?.suggested_chart === 'string' && parsed.suggested_chart.trim()
-          ? parsed.suggested_chart.trim()
-          : baseResult.suggested_chart,
-        filters: parsed?.filters && typeof parsed.filters === 'object'
-          ? (parsed.filters as Record<string, string | number | boolean>)
-          : baseResult.filters,
-        data: Array.isArray(parsed?.data)
-          ? (parsed.data as Array<Record<string, unknown>>)
-          : baseResult.data,
-        provider: providerLabel,
-        prompt_config: {
-          provider: config.provider,
-          prompt_source: config.promptSource,
-          llm_used: true,
-          llm_provider: effectiveProvider ?? undefined,
-          rule_based_answer: baseResult.answer
-        }
-      };
+      const llmJsonValid = parsed !== null;
+      // The rule-based engine is the verified source of truth. For every
+      // analytics question we already computed the numeric answer locally,
+      // so we keep it and only let the LLM rephrase the explanation. The
+      // LLM cannot see the full CSV and would otherwise invent numbers.
+      const isForecast = Boolean(baseResult.forecast_meta);
+      // When the LLM returns parseable JSON, its explanation may win because
+      // qualitative text is low-risk. The answer is preserved from the
+      // rule-based engine. When the JSON cannot be parsed (model leaked
+      // comments, malformed markdown, etc.) we fall back to the rule-based
+      // explanation as well — never use raw LLM text, because the model
+      // does not see the full CSV and will hallucinate numbers.
+      primaryResult = llmJsonValid
+        ? {
+            ...baseResult,
+            answer: baseResult.answer,
+            explanation: typeof parsed.explanation === 'string' && parsed.explanation.trim()
+              ? parsed.explanation.trim()
+              : baseResult.explanation,
+            suggested_chart: typeof parsed.suggested_chart === 'string' && parsed.suggested_chart.trim()
+              ? parsed.suggested_chart.trim()
+              : baseResult.suggested_chart,
+            filters: parsed.filters && typeof parsed.filters === 'object'
+              ? (parsed.filters as Record<string, string | number | boolean>)
+              : baseResult.filters,
+            data: Array.isArray(parsed.data)
+              ? (parsed.data as Array<Record<string, unknown>>)
+              : baseResult.data,
+            metrics: Array.isArray(parsed.metrics)
+              ? (parsed.metrics as string[])
+              : baseResult.metrics,
+            dimensions: Array.isArray(parsed.dimensions)
+              ? (parsed.dimensions as string[])
+              : baseResult.dimensions,
+            query_plan: typeof parsed.query_plan === 'string' && parsed.query_plan.trim()
+              ? parsed.query_plan.trim()
+              : baseResult.query_plan,
+            forecast_meta: baseResult.forecast_meta,
+            provider: providerLabel,
+            prompt_config: {
+              provider: config.provider,
+              prompt_source: config.promptSource,
+              llm_used: true,
+              llm_provider: effectiveProvider ?? undefined,
+              rule_based_answer: baseResult.answer
+            }
+          }
+        : {
+            ...baseResult,
+            provider: providerLabel,
+            prompt_config: {
+              provider: config.provider,
+              prompt_source: config.promptSource,
+              llm_used: true,
+              llm_provider: effectiveProvider ?? undefined,
+              llm_error: `${effectiveProvider} returned text that could not be parsed as JSON; rule-based answer used as the source of truth.`,
+              rule_based_answer: baseResult.answer
+            }
+          };
     } else {
       primaryResult = {
         ...baseResult,
