@@ -58,34 +58,37 @@ type AnalyticsResult = {
     llm_error?: string;
     llm_status?: string;
     rule_based_answer?: string;
+    llm_data_used?: boolean;
   };
 };
 
-const DEFAULT_PROMPT_TEMPLATE = `You are a logistics analytics assistant specialized in logistics KPI analysis over a CSV dataset.
-Use ONLY the provided CSV facts and derived calculations from that data.
+const DEFAULT_PROMPT_TEMPLATE = `You are a rewriter for a logistics analytics system. The numeric answer and the chart data have ALREADY been computed locally from the full CSV by a rule-based engine. Your only job is to (a) rephrase the explanation in clear, human-friendly English and (b) pick a sensible chart type from the closed list below. You must NOT recompute, edit, or override any numeric field.
 
-Rules:
-1. Base every answer on the dataset. Do not invent values, carriers, routes, dates, trends, or metrics that are not supported by the CSV.
-2. Prefer evidence-based analytics: compute counts, percentages, averages, trends, delays, route values, carrier performance, and other relevant metrics from the CSV.
-3. For descriptive questions, provide a concise answer and explain how it was derived from the data.
-4. For diagnostic questions, explain the likely pattern or cause using the available data (for example delay rate by carrier, route, or time period).
-5. For forecasting or recommendation questions, give a conservative estimate and clearly state that it is based on historical patterns rather than a guaranteed prediction.
-6. Always return valid JSON only. Do not wrap the response in markdown.
-7. Required JSON shape:
-{
-  "answer": "string",
-  "explanation": "string",
-  "suggested_chart": "string",
-  "filters": { "time_range": "string", "status": "string|null", "carrier": "string|null", "region": "string|null", "warehouse": "string|null", "metric": "string|null", "dimension": "string|null" },
-  "data": ["array of objects"],
-  "query_plan": "string",
-  "metrics": ["array of strings"],
-  "dimensions": ["array of strings"]
-}
-8. Make the answer specific, concise, and grounded in the CSV data.
-9. Use the most relevant chart type: Bar chart, Line chart, KPI cards, Table, or Scatter plot.
-10. If the question is ambiguous, choose the most likely interpretation and explain that assumption in the explanation.
-`;
+# What is NOT your job
+- "answer", "data", "filters", "metrics", and "dimensions" are authoritative and come from the rule-based engine. Keep them exactly as provided in the JSON you receive under the "AUTHORITATIVE" section. Do not change them, do not "round" them, do not "improve" them.
+- Do not invent rows. The dataset is large; the rule-based engine has already aggregated it. If the user asks for "the top route", the route is already in AUTHORITATIVE.data — quote it, do not enumerate other routes from your prior knowledge.
+
+# What IS your job
+- Rewrite "explanation" as one short paragraph (1-2 sentences) describing how the AUTHORITATIVE answer was derived. Make it specific to the user's question; mention the time window and the grouping key when relevant.
+- Pick "suggested_chart" from this exact list: "Bar chart", "Line chart", "KPI cards", "Table", "Scatter plot". Map the data shape:
+  * categorical comparison (few groups) → "Bar chart"
+  * time series or forecast vs history → "Line chart"
+  * 1-2 numbers headline-style → "KPI cards"
+  * many rows or full detail → "Table"
+  * correlation between two numeric metrics → "Scatter plot"
+
+# Dataset schema (columns you may see in AUTHORITATIVE.data)
+Each row of the source CSV has these columns. There is NO "route" column. A "route" is always represented as "origin_city → destination_city".
+- order_date, delivery_date (YYYY-MM-DD)
+- status: "delivered" | "delayed" | "in_transit" | "exception"
+- carrier (e.g. "FedEx", "UPS"), region (e.g. "Northeast")
+- origin_city, destination_city (e.g. "Newark, NJ", "Boston, MA")
+- sku, product_category, quantity, unit_price_usd, order_value_usd, is_promo, promo_discount_pct
+- warehouse
+
+# Output format
+Return a single JSON object with EXACTLY these keys: "explanation", "suggested_chart". Do NOT return "answer", "data", "filters", "metrics", "dimensions", or "query_plan" — those are already handled and any value you put there will be discarded.
+Return ONLY the JSON. No markdown fences, no prose before or after it.`;
 const DEFAULT_PROVIDER = 'rule-based';
 
 type ResolvedConfig = {
@@ -1013,7 +1016,7 @@ export async function POST(req: NextRequest) {
 
     const csvFacts = orders.length <= 25
       ? JSON.stringify(orders, null, 2)
-      : `${orders.length} orders in CSV. Aggregated metrics available via the rule-based result below.`;
+      : `${orders.length} orders in CSV.`;
 
     let llmText: string | null = null;
     let effectiveProvider: 'groq' | 'gemini' | null = null;
@@ -1023,11 +1026,28 @@ export async function POST(req: NextRequest) {
 
     if (wantsLlm) {
       try {
-        const llm = await tryLlm(
-          question,
-          `${config.promptTemplate}\n\nCSV facts (use ONLY these):\n${csvFacts}\n\nUser question: ${question}`,
-          config.provider
+        // The LLM is a rewriter, not a recomputer. We pass it the
+        // authoritative values the rule-based engine just produced and ask
+        // it to rephrase the explanation and pick a chart type. We do NOT
+        // send the raw CSV: it is summarized in one line so the model cannot
+        // attempt to compute its own answer and contradict the rule-based
+        // source of truth.
+        const llmPayload = JSON.stringify(
+          {
+            question,
+            csvFacts,
+            authoritative: {
+              answer: baseResult.answer,
+              data: baseResult.data,
+              filters: baseResult.filters,
+              metrics: baseResult.metrics,
+              dimensions: baseResult.dimensions
+            }
+          },
+          null,
+          2
         );
+        const llm = await tryLlm(question, `${config.promptTemplate}\n\n${llmPayload}`, config.provider);
         if (llm) {
           llmText = llm.text;
           effectiveProvider = llm.effectiveProvider;
@@ -1044,10 +1064,21 @@ export async function POST(req: NextRequest) {
     const providerLabel = effectiveProvider ?? 'csv-rule';
     const llmUsed = Boolean(llmText);
 
+    // Decide whether the LLM's `data` array is allowed to override the
+    // rule-based rows. The rule-based engine is the only code path that
+    // sees the full CSV, so its rows are authoritative whenever it has
+    // them. The LLM may only contribute data when the rule-based engine
+    // produced no rows (e.g. general-knowledge questions where we have
+    // no analytic to anchor on).
+    let parsed: Record<string, unknown> | null = llmUsed ? extractFirstJson(llmText!) : null;
+    const llmJsonValid = parsed !== null;
+    let llmDataOverride: Array<Record<string, unknown>> = baseResult.data;
+    if (llmJsonValid && (!baseResult.data || baseResult.data.length === 0) && Array.isArray(parsed!.data)) {
+      llmDataOverride = parsed!.data as Array<Record<string, unknown>>;
+    }
+
     let primaryResult: AnalyticsResult;
     if (llmUsed) {
-      const parsed = extractFirstJson(llmText!);
-      const llmJsonValid = parsed !== null;
       // The rule-based engine is the verified source of truth. For every
       // analytics question we already computed the numeric answer locally,
       // so we keep it and only let the LLM rephrase the explanation. The
@@ -1069,18 +1100,20 @@ export async function POST(req: NextRequest) {
             suggested_chart: typeof parsed.suggested_chart === 'string' && parsed.suggested_chart.trim()
               ? parsed.suggested_chart.trim()
               : baseResult.suggested_chart,
-            filters: parsed.filters && typeof parsed.filters === 'object'
-              ? (parsed.filters as Record<string, string | number | boolean>)
-              : baseResult.filters,
-            data: Array.isArray(parsed.data)
-              ? (parsed.data as Array<Record<string, unknown>>)
-              : baseResult.data,
-            metrics: Array.isArray(parsed.metrics)
-              ? (parsed.metrics as string[])
-              : baseResult.metrics,
-            dimensions: Array.isArray(parsed.dimensions)
-              ? (parsed.dimensions as string[])
-              : baseResult.dimensions,
+            // Filters/metrics/dimensions come from the rule-based routing layer
+            // (which keyed in to the user's intent like "last 3 months", "by route").
+            // The LLM only sees a CSV excerpt and will guess these wrong, so we keep
+            // the rule-based values verbatim.
+            filters: baseResult.filters,
+            metrics: baseResult.metrics,
+            dimensions: baseResult.dimensions,
+            // data is the most dangerous field: the LLM has no view of the full
+            // CSV and will invent rows (e.g. "route: 1, 2, 3" with made-up USD
+            // totals) even when its answer text coincidentally matches the
+            // rule-based answer. When the rule-based engine returned rows,
+            // those rows are the source of truth. The LLM may only contribute
+            // to data when the rule-based engine had nothing to say.
+            data: llmDataOverride,
             query_plan: typeof parsed.query_plan === 'string' && parsed.query_plan.trim()
               ? parsed.query_plan.trim()
               : baseResult.query_plan,
@@ -1091,7 +1124,8 @@ export async function POST(req: NextRequest) {
               prompt_source: config.promptSource,
               llm_used: true,
               llm_provider: effectiveProvider ?? undefined,
-              rule_based_answer: baseResult.answer
+              rule_based_answer: baseResult.answer,
+              llm_data_used: llmDataOverride !== baseResult.data
             }
           }
         : {

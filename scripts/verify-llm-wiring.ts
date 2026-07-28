@@ -6,13 +6,14 @@
  *  - resolveConfig() honours ANALYTICS_PROVIDER (rule-based / groq / gemini / auto / invalid).
  *  - When provider is groq/gemini/auto, the configured LLM endpoint is hit.
  *  - The rule-based engine is the verified source of truth. The LLM only
- *    contributes the qualitative explanation; it can NEVER replace the
- *    computed `answer` (the model does not see the full CSV and would
- *    otherwise hallucinate numbers).
+ *    contributes the qualitative explanation and the suggested_chart; it can
+ *    NEVER replace the computed `answer`, `data`, `filters`, `metrics`, or
+ *    `dimensions` (the model does not see the full CSV and would otherwise
+ *    hallucinate numbers).
  *  - When the LLM fails or returns nothing, the response falls back to csv-rule cleanly.
- *  - When the LLM returns parseable JSON, the parsed explanation/suggested_chart/
- *    filters/data are merged onto the rule-based result; rule_based_answer is
- *    preserved as a reference.
+ *  - When the LLM returns parseable JSON, the parsed explanation/suggested_chart
+ *    are merged onto the rule-based result; numeric fields are taken verbatim
+ *    from the rule-based engine.
  *
  * No real API calls are made.
  */
@@ -117,8 +118,9 @@ async function expectOk(name: string, condition: boolean) {
   await expectOk('groq: rule-based answer wins when LLM text is not JSON', /highest delay rate is USPS at 26\.7%/.test(groqResult.result?.answer ?? ''));
   await expectOk('groq: rule-based answer is preserved as reference', /highest delay rate is USPS at 26\.7%/.test(groqResult.prompt_config?.rule_based_answer ?? ''));
 
-  // 3. groq (structured JSON): explanation/suggested_chart/filters/data come
-  // from the parsed JSON, but `answer` is still the rule-based answer.
+  // 3. groq (structured JSON): only explanation/suggested_chart come from the
+  // parsed JSON. The rule-based engine's answer, data, filters, metrics, and
+  // dimensions are authoritative and must NOT be overridden by the LLM.
   fetchedUrls = [];
   const groqJsonResult = await runCase('groq', async (url) => {
     fetchedUrls.push(url);
@@ -133,7 +135,9 @@ async function expectOk(name: string, condition: boolean) {
   await expectOk('groq JSON: rule-based answer wins over LLM answer', /highest delay rate is USPS at 26\.7%/.test(groqJsonResult.result?.answer ?? ''));
   await expectOk('groq JSON: explanation comes from parsed JSON', /Computed by Groq/.test(groqJsonResult.result?.explanation ?? ''));
   await expectOk('groq JSON: suggested_chart comes from parsed JSON', groqJsonResult.result?.suggested_chart === 'Line chart');
-  await expectOk('groq JSON: data comes from parsed JSON', Array.isArray(groqJsonResult.result?.data) && groqJsonResult.result?.data[0]?.carrier === 'USPS');
+  await expectOk('groq JSON: data is NOT overridden by parsed JSON (rule-based wins)', Array.isArray(groqJsonResult.result?.data) && groqJsonResult.result?.data[0]?.carrier === 'USPS' && typeof groqJsonResult.result?.data[0]?.total_orders === 'number');
+  await expectOk('groq JSON: filters are NOT overridden by parsed JSON', (groqJsonResult.result?.filters as Record<string, unknown>)?.group_by === 'carrier');
+  await expectOk('groq JSON: prompt_config.llm_data_used = false', groqJsonResult.result?.prompt_config?.llm_data_used === false);
 
   // 4. gemini: hits generativelanguage.googleapis.com; answer stays rule-based.
   fetchedUrls = [];
