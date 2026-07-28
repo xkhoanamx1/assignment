@@ -114,32 +114,103 @@ function DynamicResultChart({ data }: { data: Array<Record<string, unknown>> }) 
   return <SimpleBarChart data={data} labelKey={labelKey} valueKey={metricKey} />;
 }
 
-function SampleQuestionChips({
+function TestCasePanel({
   testCases,
   activeId,
   disabled,
-  onSelect
+  actualAnswer,
+  loading,
+  onFill
 }: {
   testCases: LogisticsTestCase[];
   activeId: string | null;
   disabled: boolean;
-  onSelect: (testCase: LogisticsTestCase) => void;
+  actualAnswer: string | null;
+  loading: boolean;
+  onFill: (testCase: LogisticsTestCase) => void;
 }) {
+  const evaluateMatch = (expected: string, actual: string): {
+    status: 'exact' | 'partial' | 'mismatch';
+    score: number;
+  } => {
+    const normalize = (s: string) =>
+      s
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const e = normalize(expected);
+    const a = normalize(actual);
+    if (e === a) return { status: 'exact', score: 1 };
+    const eTokens = new Set(e.split(' ').filter(Boolean));
+    const aTokens = new Set(a.split(' ').filter(Boolean));
+    if (eTokens.size === 0) return { status: 'mismatch', score: 0 };
+    let overlap = 0;
+    eTokens.forEach((token) => {
+      if (aTokens.has(token)) overlap += 1;
+    });
+    const score = overlap / eTokens.size;
+    if (score >= 0.6) return { status: 'partial', score };
+    return { status: 'mismatch', score };
+  };
+
   return (
-    <div className="sample-chips">
-      {testCases.map((testCase) => (
-        <button
-          key={testCase.id}
-          type="button"
-          className={`sample-chip${activeId === testCase.id ? ' active' : ''}`}
-          disabled={disabled}
-          title={testCase.expectedAnswer}
-          onClick={() => onSelect(testCase)}
-        >
-          <span className="sample-chip-id">{testCase.id}</span>
-          <span className="sample-chip-text">{testCase.question}</span>
-        </button>
-      ))}
+    <div className="test-case-list">
+      {testCases.map((testCase) => {
+        const isActive = activeId === testCase.id;
+        const match =
+          isActive && actualAnswer !== null
+            ? evaluateMatch(testCase.expectedAnswer, actualAnswer)
+            : null;
+        const buttonLabel = isActive && loading ? 'Running...' : isActive ? 'Re-run' : 'Fill';
+        return (
+          <div
+            key={testCase.id}
+            className={`test-case-row${isActive ? ' active' : ''}`}
+          >
+            <div className="test-case-head">
+              <span className="test-case-id">{testCase.id}</span>
+              <span className="test-case-category">{testCase.category}</span>
+              <button
+                type="button"
+                className="test-case-fill"
+                disabled={disabled}
+                onClick={() => onFill(testCase)}
+              >
+                {buttonLabel}
+              </button>
+              {match ? (
+                <span
+                  className={`match-badge ${
+                    match.status === 'exact'
+                      ? 'match-ok'
+                      : match.status === 'partial'
+                        ? 'match-partial'
+                        : 'match-fail'
+                  }`}
+                >
+                  {match.status === 'exact'
+                    ? 'Match'
+                    : match.status === 'partial'
+                      ? `Partial ${Math.round(match.score * 100)}%`
+                      : 'Mismatch'}
+                </span>
+              ) : null}
+            </div>
+            <p className="test-case-question">
+              <strong>Question:</strong> {testCase.question}
+            </p>
+            <p className="test-case-expected">
+              <strong>Expected:</strong> {testCase.expectedAnswer}
+            </p>
+            {match && isActive && actualAnswer ? (
+              <p className="test-case-actual">
+                <strong>LLM answer:</strong> {actualAnswer}
+              </p>
+            ) : null}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -214,9 +285,6 @@ export default function HomePage() {
     ? LOGISTICS_TEST_CASES.find((testCase) => testCase.id === activeTestId)
     : null;
 
-  const answerMatchesExpected =
-    activeTest && result ? result.answer.trim() === activeTest.expectedAnswer.trim() : null;
-
   const summary = dashboard?.summary;
 
   return (
@@ -245,8 +313,12 @@ export default function HomePage() {
         <h2>Ask a business question</h2>
         <p className="muted">
           Every question is sent to the configured LLM (<code>{result?.prompt_config?.provider ?? 'groq'}</code>).
-          The sample chips below are reference Q&amp;A pairs computed directly from
-          <code> data/mock_logistics_data.csv</code>; click any of them to populate the input and run it.
+          The reference Q&amp;A pairs (computed directly from
+          <code> data/mock_logistics_data.csv</code>) live in the
+          <em> Test case panel</em> at the bottom of the page. Use the
+          <em> Fill</em> button on any test case to load the question into the
+          input above and run it through the LLM, then compare the answer
+          against the expected reference.
         </p>
         <form onSubmit={handleSubmit}>
           <textarea value={question} onChange={(e) => setQuestion(e.target.value)} rows={3} />
@@ -254,14 +326,6 @@ export default function HomePage() {
             <button type="submit" disabled={loading}>{loading ? 'Thinking...' : 'Ask'}</button>
           </div>
         </form>
-
-        <h3 className="sample-heading">Sample questions &amp; expected answers</h3>
-        <SampleQuestionChips
-          testCases={LOGISTICS_TEST_CASES}
-          activeId={activeTestId}
-          disabled={loading}
-          onSelect={handleRunTestCase}
-        />
       </section>
 
       <section className="card">
@@ -285,20 +349,6 @@ export default function HomePage() {
           <p className="error">{error}</p>
         ) : result ? (
           <div>
-            {activeTest ? (
-              <div className="expected-callout">
-                <p className="muted">
-                  <strong>Reference answer (computed from CSV):</strong> {activeTest.expectedAnswer}
-                </p>
-                {answerMatchesExpected !== null ? (
-                  <p className={answerMatchesExpected ? 'match-ok' : 'match-fail'}>
-                    {answerMatchesExpected
-                      ? 'LLM answer matches the CSV reference.'
-                      : 'LLM answer differs from the CSV reference — see comparison below.'}
-                  </p>
-                ) : null}
-              </div>
-            ) : null}
             <p><strong>Answer:</strong> {result.answer}</p>
             <p><strong>Explanation:</strong> {result.explanation}</p>
             <p><strong>Suggested chart:</strong> {result.suggested_chart}</p>
@@ -351,6 +401,25 @@ export default function HomePage() {
           Set <code>ANALYTICS_PROVIDER=groq</code> in <code>.env.local</code> to send every question through the LLM,
           or <code>rule-based</code> for the deterministic regex answers used by the demo test cases.
         </p>
+      </section>
+
+      <section className="card">
+        <h3>Test case panel</h3>
+        <p className="muted">
+          Reference Q&amp;A pairs computed directly from
+          <code> data/mock_logistics_data.csv</code>. Click <strong>Fill</strong> on any
+          row to load the question into the input above and run it through the LLM;
+          the row shows a <em>Match</em> / <em>Mismatch</em> badge once the answer
+          comes back.
+        </p>
+        <TestCasePanel
+          testCases={LOGISTICS_TEST_CASES}
+          activeId={activeTestId}
+          disabled={loading}
+          actualAnswer={activeTest && result && activeTestId === activeTest.id ? result.answer : null}
+          loading={loading}
+          onFill={handleRunTestCase}
+        />
       </section>
     </main>
   );
