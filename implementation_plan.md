@@ -207,3 +207,16 @@ Không cần làm quá phức tạp để tránh mất thời gian.
 5. Deploy lên Render/Vercel
 
 Nếu cần, tôi có thể tiếp tục chuyển kế hoạch này thành code khung project ngay lập tức.
+
+## 12. Provider configuration (cập nhật sau khi review)
+
+API `/api/query` đọc `ANALYTICS_PROVIDER` và `ANALYTICS_PROMPT_TEMPLATE` từ `.env.local`:
+
+- `rule-based` (mặc định): không gọi LLM, trả lời rule-based từ CSV. Đây là mode đang chạy cho 10 test case demo.
+- `groq`: gọi Groq (`llama-3.1-8b-instant`) với `GROQ_API_KEY`. LLM insight được thêm vào phần explanation nhưng giữ nguyên câu trả lời rule-based để test case vẫn khớp expected answer.
+- `gemini`: gọi Gemini (`gemini-2.0-flash`) với `GEMINI_API_KEY`. Lưu ý: `GEMINI_API_KEY` phải là Google AI Studio key (bắt đầu bằng `AIza...`), không phải Azure gateway token (`AQ.`).
+- `auto`: ưu tiên Groq nếu có key, fallback sang Gemini.
+
+Khi LLM thất bại (lỗi mạng, quota, key sai), response vẫn trả về `provider: 'csv-rule'` kèm `prompt_config.llm_error` để frontend hiển thị. Không có exception nào được ném ra phía client.
+
+Để test nhanh: `npx tsx scripts/verify-llm-wiring.ts` (mock fetch, không gọi network thật).

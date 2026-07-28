@@ -29,6 +29,11 @@ type ResultData = {
   prompt_config?: {
     provider: string;
     prompt_source: string;
+    llm_used?: boolean;
+    llm_provider?: 'groq' | 'gemini';
+    llm_error?: string;
+    llm_status?: string;
+    rule_based_answer?: string;
   };
 };
 
@@ -107,6 +112,36 @@ function DynamicResultChart({ data }: { data: Array<Record<string, unknown>> }) 
   const labelKey = Object.keys(first).find((key) => key !== metricKey) || 'label';
 
   return <SimpleBarChart data={data} labelKey={labelKey} valueKey={metricKey} />;
+}
+
+function SampleQuestionChips({
+  testCases,
+  activeId,
+  disabled,
+  onSelect
+}: {
+  testCases: LogisticsTestCase[];
+  activeId: string | null;
+  disabled: boolean;
+  onSelect: (testCase: LogisticsTestCase) => void;
+}) {
+  return (
+    <div className="sample-chips">
+      {testCases.map((testCase) => (
+        <button
+          key={testCase.id}
+          type="button"
+          className={`sample-chip${activeId === testCase.id ? ' active' : ''}`}
+          disabled={disabled}
+          title={testCase.expectedAnswer}
+          onClick={() => onSelect(testCase)}
+        >
+          <span className="sample-chip-id">{testCase.id}</span>
+          <span className="sample-chip-text">{testCase.question}</span>
+        </button>
+      ))}
+    </div>
+  );
 }
 
 export default function HomePage() {
@@ -207,43 +242,26 @@ export default function HomePage() {
       </section>
 
       <section className="card">
-        <h2>Reliable demo test cases (English)</h2>
-        <p className="muted">
-          Ten questions with expected answers computed from <code>data/mock_logistics_data.csv</code> using the same
-          rule-based analytics as the API. Regenerate with <code>node scripts/generate-test-cases.mjs</code>.
-        </p>
-        <div className="test-case-list">
-          {LOGISTICS_TEST_CASES.map((testCase) => (
-            <article key={testCase.id} className={`test-case-item${activeTestId === testCase.id ? ' active' : ''}`}>
-              <div className="test-case-head">
-                <span className="test-case-id">{testCase.id}</span>
-                <span className="test-case-category">{testCase.category}</span>
-              </div>
-              <p className="test-case-question">{testCase.question}</p>
-              <p className="test-case-expected">
-                <strong>Expected answer:</strong> {testCase.expectedAnswer}
-              </p>
-              <button
-                type="button"
-                className="secondary"
-                disabled={loading}
-                onClick={() => handleRunTestCase(testCase)}
-              >
-                Run test case
-              </button>
-            </article>
-          ))}
-        </div>
-      </section>
-
-      <section className="card">
         <h2>Ask a business question</h2>
+        <p className="muted">
+          Every question is sent to the configured LLM (<code>{result?.prompt_config?.provider ?? 'groq'}</code>).
+          The sample chips below are reference Q&amp;A pairs computed directly from
+          <code> data/mock_logistics_data.csv</code>; click any of them to populate the input and run it.
+        </p>
         <form onSubmit={handleSubmit}>
           <textarea value={question} onChange={(e) => setQuestion(e.target.value)} rows={3} />
           <div className="actions">
             <button type="submit" disabled={loading}>{loading ? 'Thinking...' : 'Ask'}</button>
           </div>
         </form>
+
+        <h3 className="sample-heading">Sample questions &amp; expected answers</h3>
+        <SampleQuestionChips
+          testCases={LOGISTICS_TEST_CASES}
+          activeId={activeTestId}
+          disabled={loading}
+          onSelect={handleRunTestCase}
+        />
       </section>
 
       <section className="card">
@@ -259,6 +277,14 @@ export default function HomePage() {
             ) : <p>No carrier data.</p>}
           </div>
         </div>
+
+        <h3 className="sample-heading">Quick reference: same samples, always visible</h3>
+        <SampleQuestionChips
+          testCases={LOGISTICS_TEST_CASES}
+          activeId={activeTestId}
+          disabled={loading}
+          onSelect={handleRunTestCase}
+        />
       </section>
 
       <section className="card">
@@ -267,12 +293,19 @@ export default function HomePage() {
           <p className="error">{error}</p>
         ) : result ? (
           <div>
-            {answerMatchesExpected !== null ? (
-              <p className={answerMatchesExpected ? 'match-ok' : 'match-fail'}>
-                {answerMatchesExpected
-                  ? 'API answer matches the expected test-case answer.'
-                  : 'API answer differs from the expected test-case answer (see Expected answer in the test case list).'}
-              </p>
+            {activeTest ? (
+              <div className="expected-callout">
+                <p className="muted">
+                  <strong>Reference answer (computed from CSV):</strong> {activeTest.expectedAnswer}
+                </p>
+                {answerMatchesExpected !== null ? (
+                  <p className={answerMatchesExpected ? 'match-ok' : 'match-fail'}>
+                    {answerMatchesExpected
+                      ? 'LLM answer matches the CSV reference.'
+                      : 'LLM answer differs from the CSV reference — see comparison below.'}
+                  </p>
+                ) : null}
+              </div>
             ) : null}
             <p><strong>Answer:</strong> {result.answer}</p>
             <p><strong>Explanation:</strong> {result.explanation}</p>
@@ -294,8 +327,38 @@ export default function HomePage() {
 
       <section className="card info">
         <h3>Prompt setup</h3>
-        <p>The prompt and provider mode are now fixed in the application code, so you do not need to edit environment variables for this demo.</p>
-        <p>Current mode: <strong>rule-based</strong> with the built-in logistics prompt.</p>
+        {result?.prompt_config ? (
+          <div>
+            <p>
+              <strong>Provider mode:</strong> {result.prompt_config.provider}
+            </p>
+            <p>
+              <strong>Prompt source:</strong> {result.prompt_config.prompt_source}
+            </p>
+            <p>
+              <strong>LLM called:</strong>{' '}
+              {result.prompt_config.llm_used
+                ? `yes (${result.prompt_config.llm_provider})`
+                : 'no'}
+            </p>
+            {result.prompt_config.llm_error ? (
+              <p className="error">
+                <strong>LLM diagnostic:</strong> {result.prompt_config.llm_error}
+              </p>
+            ) : null}
+            {result.prompt_config.llm_status ? (
+              <p className="muted">
+                <strong>Status:</strong> {result.prompt_config.llm_status}
+              </p>
+            ) : null}
+          </div>
+        ) : (
+          <p>The provider and prompt template are configured via <code>ANALYTICS_PROVIDER</code> and <code>ANALYTICS_PROMPT_TEMPLATE</code> in <code>.env.local</code>.</p>
+        )}
+        <p className="muted">
+          Set <code>ANALYTICS_PROVIDER=groq</code> in <code>.env.local</code> to send every question through the LLM,
+          or <code>rule-based</code> for the deterministic regex answers used by the demo test cases.
+        </p>
       </section>
     </main>
   );

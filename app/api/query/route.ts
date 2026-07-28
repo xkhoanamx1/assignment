@@ -36,6 +36,11 @@ type AnalyticsResult = {
   prompt_config?: {
     provider: string;
     prompt_source: string;
+    llm_used?: boolean;
+    llm_provider?: 'groq' | 'gemini';
+    llm_error?: string;
+    llm_status?: string;
+    rule_based_answer?: string;
   };
 };
 
@@ -65,6 +70,30 @@ Rules:
 10. If the question is ambiguous, choose the most likely interpretation and explain that assumption in the explanation.
 `;
 const DEFAULT_PROVIDER = 'rule-based';
+
+type ResolvedConfig = {
+  provider: 'rule-based' | 'groq' | 'gemini' | 'auto';
+  promptTemplate: string;
+  promptSource: 'code' | 'env';
+  resolvedFromEnv: boolean;
+};
+
+function resolveConfig(): ResolvedConfig {
+  const envProvider = (process.env.ANALYTICS_PROVIDER || '').toLowerCase().trim();
+  const envPrompt = process.env.ANALYTICS_PROMPT_TEMPLATE;
+
+  const allowed = new Set(['rule-based', 'groq', 'gemini', 'auto']);
+  const provider: ResolvedConfig['provider'] = allowed.has(envProvider)
+    ? (envProvider as ResolvedConfig['provider'])
+    : (DEFAULT_PROVIDER as ResolvedConfig['provider']);
+
+  return {
+    provider,
+    promptTemplate: envPrompt && envPrompt.trim() ? envPrompt : DEFAULT_PROMPT_TEMPLATE,
+    promptSource: envPrompt && envPrompt.trim() ? 'env' : 'code',
+    resolvedFromEnv: Boolean(envProvider) || Boolean(envPrompt)
+  };
+}
 
 function parseCsv(content: string) {
   const rows: string[][] = [];
@@ -607,88 +636,221 @@ function buildAnalyticsResult(question: string, orders: OrderRow[]): AnalyticsRe
   return buildSummaryResult(question, orders);
 }
 
-async function callLlm(question: string, promptTemplate: string) {
-  const provider = DEFAULT_PROVIDER.toLowerCase();
-  const geminiKey = process.env.GEMINI_API_KEY;
+async function callGroq(question: string, promptTemplate: string): Promise<{ text: string; raw: unknown } | null> {
   const groqKey = process.env.GROQ_API_KEY;
+  if (!groqKey) return null;
 
-  if (provider === 'groq' && groqKey) {
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${groqKey}`
-      },
-      body: JSON.stringify({
-        model: 'llama-3.1-8b-instant',
-        messages: [
-          { role: 'system', content: promptTemplate },
-          { role: 'user', content: question }
-        ],
-        temperature: 0.2
-      })
-    });
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${groqKey}`
+    },
+    body: JSON.stringify({
+      model: 'llama-3.1-8b-instant',
+      messages: [
+        { role: 'system', content: promptTemplate },
+        { role: 'user', content: question }
+      ],
+      temperature: 0.2
+    })
+  });
 
-    if (!response.ok) return null;
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || null;
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '');
+    throw new Error(`Groq API ${response.status}: ${errorText.slice(0, 200)}`);
   }
 
-  if (provider === 'gemini' && geminiKey) {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`, {
+  const data = await response.json();
+  const text = data.choices?.[0]?.message?.content || null;
+  return text ? { text, raw: data } : null;
+}
+
+async function callGemini(question: string, promptTemplate: string): Promise<{ text: string; raw: unknown } | null> {
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!geminiKey) return null;
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`,
+    {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [{ parts: [{ text: `${promptTemplate}\n\nUser question: ${question}` }] }]
       })
-    });
+    }
+  );
 
-    if (!response.ok) return null;
-    const data = await response.json();
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || null;
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '');
+    throw new Error(`Gemini API ${response.status}: ${errorText.slice(0, 200)}`);
   }
 
+  const data = await response.json();
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || null;
+  return text ? { text, raw: data } : null;
+}
+
+async function tryLlm(question: string, promptTemplate: string, provider: ResolvedConfig['provider']): Promise<{
+  text: string;
+  effectiveProvider: 'groq' | 'gemini';
+} | null> {
+  const order: Array<'groq' | 'gemini'> =
+    provider === 'gemini' ? ['gemini', 'groq'] :
+    provider === 'auto' ? (process.env.GROQ_API_KEY ? ['groq', 'gemini'] : ['gemini', 'groq']) :
+    ['groq'];
+
+  for (const candidate of order) {
+    try {
+      const result = candidate === 'groq'
+        ? await callGroq(question, promptTemplate)
+        : await callGemini(question, promptTemplate);
+      if (result) return { text: result.text, effectiveProvider: candidate };
+    } catch (err) {
+      console.warn(`[query] ${candidate} call failed:`, err instanceof Error ? err.message : err);
+    }
+  }
   return null;
+}
+
+function extractFirstJson(text: string): Record<string, unknown> | null {
+  const trimmed = text.trim();
+  const direct = trimmed.startsWith('{') ? trimmed : null;
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = direct || (fenced ? fenced[1].trim() : null);
+  if (!candidate) return null;
+  try {
+    const parsed = JSON.parse(candidate);
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function summarizeLlmText(text: string): string {
+  const cleaned = text.trim();
+  return cleaned.length > 600 ? `${cleaned.slice(0, 600)}...` : cleaned;
 }
 
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({ question: '' }));
   const { question } = body;
+  const config = resolveConfig();
 
   try {
     const orders = await loadOrders();
-    const result = buildAnalyticsResult(question, orders);
-    const promptTemplate = DEFAULT_PROMPT_TEMPLATE;
-    const provider = DEFAULT_PROVIDER.toLowerCase();
-    const promptSource = 'code';
+    const baseResult = buildAnalyticsResult(question, orders);
 
-    if (question && provider !== 'rule-based') {
-      const llmText = await callLlm(question, promptTemplate);
-      if (llmText) {
-        return Response.json({
-          ok: true,
-          provider,
-          result: {
-            ...result,
-            answer: llmText,
-            explanation: `${result.explanation} (LLM prompt: ${promptSource})`,
-            provider,
-            prompt_config: { provider, prompt_source: promptSource }
-          },
-          prompt_config: { provider, prompt_source: promptSource }
-        });
+    if (!question) {
+      return Response.json({
+        ok: true,
+        provider: 'csv-rule',
+        result: {
+          ...baseResult,
+          provider: 'csv-rule',
+          prompt_config: {
+            provider: config.provider,
+            prompt_source: config.promptSource,
+            llm_used: false,
+            llm_status: 'skipped_empty_question'
+          }
+        },
+        prompt_config: {
+          provider: config.provider,
+          prompt_source: config.promptSource,
+          llm_used: false,
+          llm_status: 'skipped_empty_question'
+        }
+      });
+    }
+
+    const csvFacts = orders.length <= 25
+      ? JSON.stringify(orders, null, 2)
+      : `${orders.length} orders in CSV. Aggregated metrics available via the rule-based result below.`;
+
+    let llmText: string | null = null;
+    let effectiveProvider: 'groq' | 'gemini' | null = null;
+    let llmError: string | null = null;
+
+    const wantsLlm = config.provider === 'groq' || config.provider === 'gemini' || config.provider === 'auto';
+
+    if (wantsLlm) {
+      try {
+        const llm = await tryLlm(
+          question,
+          `${config.promptTemplate}\n\nCSV facts (use ONLY these):\n${csvFacts}\n\nUser question: ${question}`,
+          config.provider
+        );
+        if (llm) {
+          llmText = llm.text;
+          effectiveProvider = llm.effectiveProvider;
+        } else {
+          llmError = 'No LLM provider returned a response (check API keys and quotas).';
+        }
+      } catch (err) {
+        llmError = err instanceof Error ? err.message : 'LLM call failed.';
       }
+    } else {
+      llmError = 'ANALYTICS_PROVIDER is set to rule-based; LLM is disabled.';
+    }
+
+    const providerLabel = effectiveProvider ?? 'csv-rule';
+    const llmUsed = Boolean(llmText);
+
+    let primaryResult: AnalyticsResult;
+    if (llmUsed) {
+      const parsed = extractFirstJson(llmText!);
+      primaryResult = {
+        ...baseResult,
+        answer: typeof parsed?.answer === 'string' && parsed.answer.trim()
+          ? parsed.answer.trim()
+          : summarizeLlmText(llmText!),
+        explanation: typeof parsed?.explanation === 'string' && parsed.explanation.trim()
+          ? parsed.explanation.trim()
+          : `Answered by ${effectiveProvider} using the configured logistics prompt.`,
+        suggested_chart: typeof parsed?.suggested_chart === 'string' && parsed.suggested_chart.trim()
+          ? parsed.suggested_chart.trim()
+          : baseResult.suggested_chart,
+        filters: parsed?.filters && typeof parsed.filters === 'object'
+          ? (parsed.filters as Record<string, string | number | boolean>)
+          : baseResult.filters,
+        data: Array.isArray(parsed?.data)
+          ? (parsed.data as Array<Record<string, unknown>>)
+          : baseResult.data,
+        provider: providerLabel,
+        prompt_config: {
+          provider: config.provider,
+          prompt_source: config.promptSource,
+          llm_used: true,
+          llm_provider: effectiveProvider ?? undefined,
+          rule_based_answer: baseResult.answer
+        }
+      };
+    } else {
+      primaryResult = {
+        ...baseResult,
+        provider: providerLabel,
+        prompt_config: {
+          provider: config.provider,
+          prompt_source: config.promptSource,
+          llm_used: false,
+          llm_error: llmError ?? undefined
+        }
+      };
     }
 
     return Response.json({
       ok: true,
-      provider: 'csv-rule',
-      result: {
-        ...result,
-        provider: 'csv-rule',
-        prompt_config: { provider, prompt_source: promptSource }
-      },
-      prompt_config: { provider, prompt_source: promptSource }
+      provider: providerLabel,
+      result: primaryResult,
+      prompt_config: {
+        provider: config.provider,
+        prompt_source: config.promptSource,
+        llm_used: llmUsed,
+        llm_provider: effectiveProvider ?? undefined,
+        llm_error: llmError ?? undefined,
+        rule_based_answer: primaryResult.prompt_config?.rule_based_answer
+      }
     });
   } catch (error) {
     return Response.json(
