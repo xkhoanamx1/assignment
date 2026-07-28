@@ -277,14 +277,6 @@ export default function HomePage() {
             ) : <p>No carrier data.</p>}
           </div>
         </div>
-
-        <h3 className="sample-heading">Quick reference: same samples, always visible</h3>
-        <SampleQuestionChips
-          testCases={LOGISTICS_TEST_CASES}
-          activeId={activeTestId}
-          disabled={loading}
-          onSelect={handleRunTestCase}
-        />
       </section>
 
       <section className="card">
