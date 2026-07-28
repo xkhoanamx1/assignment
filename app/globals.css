@@ -58,3 +58,10 @@ code { font-family: Consolas, monospace; font-size: 0.9em; color: #93c5fd; }
 .match-badge.match-fail { background: #78350f; color: #fbbf24; border: 1px solid #d97706; }
 .test-case-actual { margin: 8px 0 0; color: #cbd5e1; font-size: 0.92rem; background: #0b1220; padding: 8px 10px; border-radius: 6px; border: 1px solid #1e293b; }
 
+/* Forecast chart */
+.forecast-chart-wrapper { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.forecast-chart-header { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; justify-content: space-between; }
+.forecast-chart-header strong { color: #e2e8f0; font-size: 0.95rem; }
+.forecast-chart-summary { color: #94a3b8; font-size: 0.85rem; }
+.forecast-chart-summary strong { color: #f8fafc; margin-left: 2px; margin-right: 2px; }
+

@@ -155,7 +155,25 @@ function LineChart({ data, xKey, yKey }: { data: Array<Record<string, unknown>>;
   );
 }
 
-function ForecastChart({ data }: { data: Array<Record<string, unknown>> }) {
+type ForecastMeta = {
+  method: string;
+  slope: number;
+  intercept: number;
+  historical_points: number;
+  recommendation_units: number;
+  safety_stock_factor: number;
+  horizon_months: number;
+};
+
+function ForecastChart({
+  data,
+  forecastMeta,
+  scopeLabel
+}: {
+  data: Array<Record<string, unknown>>;
+  forecastMeta?: ForecastMeta;
+  scopeLabel?: string;
+}) {
   if (!data.length) return <p>No chart data.</p>;
 
   const allValues = data.flatMap((row) => {
@@ -164,6 +182,9 @@ function ForecastChart({ data }: { data: Array<Record<string, unknown>> }) {
     if (row.forecast !== null && row.forecast !== undefined) cells.push(Number(row.forecast));
     return cells;
   });
+  const recommendationUnits = forecastMeta?.recommendation_units ?? 0;
+  if (recommendationUnits > 0) allValues.push(recommendationUnits);
+
   const maxValue = Math.max(1, ...allValues);
   const minValue = Math.min(0, ...allValues);
   const range = Math.max(1, maxValue - minValue);
@@ -172,14 +193,14 @@ function ForecastChart({ data }: { data: Array<Record<string, unknown>> }) {
   const xAt = (index: number) => 40 + index * stepX;
   const yAt = (value: number) => 180 - ((value - minValue) / range) * 140;
 
-  const histPoints: Array<{ x: number; y: number }> = [];
-  const forecastPoints: Array<{ x: number; y: number }> = [];
+  const histPoints: Array<{ x: number; y: number; index: number }> = [];
+  const forecastPoints: Array<{ x: number; y: number; index: number }> = [];
   data.forEach((row, index) => {
     if (row.historical !== null && row.historical !== undefined) {
-      histPoints.push({ x: xAt(index), y: yAt(Number(row.historical)) });
+      histPoints.push({ x: xAt(index), y: yAt(Number(row.historical)), index });
     }
     if (row.forecast !== null && row.forecast !== undefined) {
-      forecastPoints.push({ x: xAt(index), y: yAt(Number(row.forecast)) });
+      forecastPoints.push({ x: xAt(index), y: yAt(Number(row.forecast)), index });
     }
   });
 
@@ -192,25 +213,98 @@ function ForecastChart({ data }: { data: Array<Record<string, unknown>> }) {
     ? `M ${histPoints[histPoints.length - 1].x.toFixed(1)},${histPoints[histPoints.length - 1].y.toFixed(1)} L ${forecastPoints[0].x.toFixed(1)},${forecastPoints[0].y.toFixed(1)}`
     : '';
 
+  const recommendationY = recommendationUnits > 0 ? yAt(recommendationUnits) : null;
+
+  // Y-axis tick lines: 0, mid, max (plus recommendation level if it falls outside)
+  const tickCandidates = [0, Math.round(maxValue / 2), Math.round(maxValue)];
+  if (recommendationUnits > 0 && !tickCandidates.includes(Math.round(recommendationUnits))) {
+    tickCandidates.push(Math.round(recommendationUnits));
+  }
+  const ticks = Array.from(new Set(tickCandidates.filter((v) => v >= 0))).sort((a, b) => a - b);
+
   return (
-    <svg viewBox="0 0 480 220" className="chart">
-      <line x1="20" y1="180" x2="460" y2="180" stroke="#64748b" />
-      <line x1="20" y1="20" x2="20" y2="180" stroke="#64748b" />
-      {histPoints.map((pt, i) => (
-        <circle key={`h-${i}`} cx={pt.x} cy={pt.y} r="4" fill="#38bdf8" />
-      ))}
-      {forecastPoints.map((pt, i) => (
-        <circle key={`f-${i}`} cx={pt.x} cy={pt.y} r="4" fill="#f59e0b" />
-      ))}
-      {histPath ? <path fill="none" stroke="#38bdf8" strokeWidth="2" d={histPath} /> : null}
-      {bridgePoint ? <path fill="none" stroke="#94a3b8" strokeWidth="1.5" strokeDasharray="4 3" d={bridgePoint} /> : null}
-      {forecastPath ? <path fill="none" stroke="#f59e0b" strokeWidth="2" strokeDasharray="6 4" d={forecastPath} /> : null}
-      {data.map((row, index) => (
-        <text key={`lbl-${index}`} x={xAt(index)} y="200" textAnchor="middle" fontSize="9" fill="#94a3b8">
-          {String(row.month ?? '').slice(2)}
-        </text>
-      ))}
-    </svg>
+    <div className="forecast-chart-wrapper">
+      <div className="forecast-chart-header">
+        <strong>{scopeLabel ? `Demand forecast — ${scopeLabel}` : 'Demand forecast'}</strong>
+        <span className="forecast-chart-summary">
+          avg <strong>{forecastMeta ? Math.round((forecastPoints.reduce((s, p) => s + Number(data[p.index]?.forecast ?? 0), 0) / Math.max(1, forecastPoints.length)) * 10) / 10 : '—'}</strong>
+          {' · '}
+          peak <strong>{forecastMeta ? Math.max(...forecastPoints.map((p) => Number(data[p.index]?.forecast ?? 0))).toFixed(1) : '—'}</strong>
+          {' · '}
+          recommendation <strong>{forecastMeta ? recommendationUnits : '—'}</strong> units
+        </span>
+      </div>
+      <svg viewBox="0 0 540 220" className="chart">
+        {/* horizontal gridlines + y-axis tick labels */}
+        {ticks.map((tick) => {
+          const y = yAt(tick);
+          return (
+            <g key={`tick-${tick}`}>
+              <line x1="40" y1={y.toFixed(1)} x2="500" y2={y.toFixed(1)} stroke="#1e293b" strokeDasharray="2 4" />
+              <text x="36" y={(y + 3).toFixed(1)} textAnchor="end" fontSize="9" fill="#94a3b8">
+                {tick}
+              </text>
+            </g>
+          );
+        })}
+        <line x1="40" y1="180" x2="500" y2="180" stroke="#64748b" />
+        <line x1="40" y1="20" x2="40" y2="180" stroke="#64748b" />
+
+        {/* recommendation reference line */}
+        {recommendationY !== null ? (
+          <g>
+            <line x1="40" y1={recommendationY.toFixed(1)} x2="500" y2={recommendationY.toFixed(1)} stroke="#22c55e" strokeWidth="1.5" strokeDasharray="5 4" />
+            <text x="496" y={(recommendationY - 4).toFixed(1)} textAnchor="end" fontSize="10" fill="#22c55e">
+              Recommendation {recommendationUnits}u
+            </text>
+          </g>
+        ) : null}
+
+        {/* data points + lines */}
+        {histPoints.map((pt, i) => (
+          <circle key={`h-${i}`} cx={pt.x} cy={pt.y} r="4" fill="#38bdf8" />
+        ))}
+        {forecastPoints.map((pt, i) => (
+          <circle key={`f-${i}`} cx={pt.x} cy={pt.y} r="4" fill="#f59e0b" />
+        ))}
+        {histPath ? <path fill="none" stroke="#38bdf8" strokeWidth="2" d={histPath} /> : null}
+        {bridgePoint ? <path fill="none" stroke="#94a3b8" strokeWidth="1.5" strokeDasharray="4 3" d={bridgePoint} /> : null}
+        {forecastPath ? <path fill="none" stroke="#f59e0b" strokeWidth="2" strokeDasharray="6 4" d={forecastPath} /> : null}
+
+        {/* x-axis labels: show full YY-MM for last historical + all forecasts */}
+        {data.map((row, index) => {
+          const monthLabel = String(row.month ?? '');
+          const isForecast = row.historical === null || row.historical === undefined;
+          const fill = isForecast ? '#f59e0b' : '#94a3b8';
+          return (
+            <text
+              key={`lbl-${index}`}
+              x={xAt(index)}
+              y="200"
+              textAnchor="middle"
+              fontSize="9"
+              fill={fill}
+            >
+              {monthLabel.slice(2)}
+            </text>
+          );
+        })}
+
+        {/* legend */}
+        <g transform="translate(40, 12)">
+          <rect x="0" y="-6" width="10" height="3" fill="#38bdf8" />
+          <text x="14" y="-2" fontSize="10" fill="#cbd5e1">Historical</text>
+          <rect x="78" y="-6" width="10" height="3" fill="#f59e0b" />
+          <text x="92" y="-2" fontSize="10" fill="#cbd5e1">Forecast</text>
+          {recommendationUnits > 0 ? (
+            <>
+              <line x1="148" y1="-4" x2="158" y2="-4" stroke="#22c55e" strokeDasharray="5 4" />
+              <text x="162" y="-2" fontSize="10" fill="#cbd5e1">Recommendation</text>
+            </>
+          ) : null}
+        </g>
+      </svg>
+    </div>
   );
 }
 
@@ -290,13 +384,23 @@ function ScatterChart({ data, xKey, yKey }: { data: Array<Record<string, unknown
   );
 }
 
-function DynamicResultChart({ data, suggestedChart }: { data: Array<Record<string, unknown>>; suggestedChart: string }) {
+function DynamicResultChart({
+  data,
+  suggestedChart,
+  forecastMeta,
+  scopeLabel
+}: {
+  data: Array<Record<string, unknown>>;
+  suggestedChart: string;
+  forecastMeta?: ForecastMeta;
+  scopeLabel?: string;
+}) {
   if (!data.length) return null;
   const chartType = (suggestedChart || '').toLowerCase();
 
   if (chartType.includes('line') || data.some((row) => 'forecast' in row || 'historical' in row)) {
     if (data.some((row) => 'forecast' in row || 'historical' in row)) {
-      return <ForecastChart data={data} />;
+      return <ForecastChart data={data} forecastMeta={forecastMeta} scopeLabel={scopeLabel} />;
     }
     const xKey = Object.keys(data[0]).find((k) => /month|week|date|label|name|day/i.test(k)) || Object.keys(data[0])[0];
     const yKey = Object.keys(data[0]).find((k) => /count|orders|rate|value|quantity|total|amount|forecast/i.test(k)) || Object.keys(data[0])[1] || 'value';
@@ -582,7 +686,16 @@ export default function HomePage() {
             {result.data && result.data.length > 0 ? (
               <div className="result-block">
                 <strong>Chart:</strong>
-                <DynamicResultChart data={result.data} suggestedChart={result.suggested_chart} />
+                <DynamicResultChart
+                  data={result.data}
+                  suggestedChart={result.suggested_chart}
+                  forecastMeta={result.forecast_meta as ForecastMeta | undefined}
+                  scopeLabel={
+                    typeof result.filters?.sku === 'string' && result.filters.sku !== 'all'
+                      ? `SKU ${result.filters.sku}`
+                      : 'all SKUs'
+                  }
+                />
                 <pre>{JSON.stringify(result.data, null, 2)}</pre>
               </div>
             ) : null}
