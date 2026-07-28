@@ -18,7 +18,51 @@ type AnalyticsResult = {
   suggested_chart: string;
   filters: Record<string, string | number | boolean>;
   data: Array<Record<string, unknown>>;
+  dashboard?: {
+    summary: {
+      total_orders: number;
+      delivered: number;
+      delayed: number;
+      on_time_rate: number;
+      avg_delivery_days: number;
+    };
+    monthly_trend: Array<Record<string, unknown>>;
+    carrier_delay_rates: Array<Record<string, unknown>>;
+    status_breakdown: Array<Record<string, unknown>>;
+  };
+  provider?: string;
+  prompt_config?: {
+    provider: string;
+    prompt_source: string;
+  };
 };
+
+const DEFAULT_PROMPT_TEMPLATE = `You are a logistics analytics assistant specialized in logistics KPI analysis over a CSV dataset.
+Use ONLY the provided CSV facts and derived calculations from that data.
+
+Rules:
+1. Base every answer on the dataset. Do not invent values, carriers, routes, dates, trends, or metrics that are not supported by the CSV.
+2. Prefer evidence-based analytics: compute counts, percentages, averages, trends, delays, route values, carrier performance, and other relevant metrics from the CSV.
+3. For descriptive questions, provide a concise answer and explain how it was derived from the data.
+4. For diagnostic questions, explain the likely pattern or cause using the available data (for example delay rate by carrier, route, or time period).
+5. For forecasting or recommendation questions, give a conservative estimate and clearly state that it is based on historical patterns rather than a guaranteed prediction.
+6. Always return valid JSON only. Do not wrap the response in markdown.
+7. Required JSON shape:
+{
+  "answer": "string",
+  "explanation": "string",
+  "suggested_chart": "string",
+  "filters": { "time_range": "string", "status": "string|null", "carrier": "string|null", "region": "string|null", "warehouse": "string|null", "metric": "string|null", "dimension": "string|null" },
+  "data": ["array of objects"],
+  "query_plan": "string",
+  "metrics": ["array of strings"],
+  "dimensions": ["array of strings"]
+}
+8. Make the answer specific, concise, and grounded in the CSV data.
+9. Use the most relevant chart type: Bar chart, Line chart, KPI cards, Table, or Scatter plot.
+10. If the question is ambiguous, choose the most likely interpretation and explain that assumption in the explanation.
+`;
+const DEFAULT_PROVIDER = 'rule-based';
 
 function parseCsv(content: string) {
   const rows: string[][] = [];
@@ -112,22 +156,98 @@ function isVietnamese(text: string) {
   return /[áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđĐ]/.test(text);
 }
 
-function getLastMonthsOrders(orders: OrderRow[], months = 3) {
-  const latestDate = orders.reduce((latest, order) => {
-    const current = new Date(order.order_date);
-    return current > latest ? current : latest;
-  }, new Date(0));
+function getSafeDate(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
 
+function getLastMonthsOrders(orders: OrderRow[], months = 3) {
+  const validDates = orders
+    .map((order) => ({ order, date: getSafeDate(order.order_date) }))
+    .filter((entry): entry is { order: OrderRow; date: Date } => Boolean(entry.date));
+
+  if (!validDates.length) return [];
+
+  const latestDate = validDates.reduce((latest, entry) => (entry.date > latest ? entry.date : latest), new Date(0));
   const cutoff = new Date(latestDate);
   cutoff.setMonth(cutoff.getMonth() - months);
 
-  return orders.filter((order) => new Date(order.order_date) >= cutoff);
+  return validDates.filter((entry) => entry.date >= cutoff).map((entry) => entry.order);
 }
 
 function getWeekKey(date: Date) {
   const start = new Date(date.getFullYear(), 0, 1);
   const diff = Math.floor((date.getTime() - start.getTime()) / 86400000);
   return `${date.getFullYear()}-W${Math.ceil((diff + 1) / 7)}`;
+}
+
+function buildDashboard(orders: OrderRow[]) {
+  const filtered = getLastMonthsOrders(orders);
+  const total = filtered.length;
+  const delivered = filtered.filter((order) => order.status === 'delivered').length;
+  const delayed = filtered.filter((order) => order.status === 'delayed').length;
+  const on_time_rate = total ? Number(((delivered / total) * 100).toFixed(1)) : 0;
+
+  const deliveryDays = filtered
+    .map((order) => {
+      const orderDate = getSafeDate(order.order_date);
+      const deliveryDate = getSafeDate(order.delivery_date);
+      if (!orderDate || !deliveryDate) return null;
+      return Math.max(0, Math.round((deliveryDate.getTime() - orderDate.getTime()) / 86400000));
+    })
+    .filter((value): value is number => value !== null);
+
+  const avg_delivery_days = deliveryDays.length ? Number((deliveryDays.reduce((sum, value) => sum + value, 0) / deliveryDays.length).toFixed(1)) : 0;
+
+  const monthlyMap = new Map<string, { month: string; delivered: number; delayed: number }>();
+  filtered.forEach((order) => {
+    const orderDate = getSafeDate(order.order_date);
+    if (!orderDate) return;
+    const month = `${orderDate.getFullYear()}-${String(orderDate.getMonth() + 1).padStart(2, '0')}`;
+    const entry = monthlyMap.get(month) || { month, delivered: 0, delayed: 0 };
+    if (order.status === 'delivered') entry.delivered += 1;
+    if (order.status === 'delayed') entry.delayed += 1;
+    monthlyMap.set(month, entry);
+  });
+
+  const monthly_trend = Array.from(monthlyMap.values()).sort((a, b) => a.month.localeCompare(b.month));
+
+  const carrierStats = new Map<string, { total: number; delayed: number }>();
+  filtered.forEach((order) => {
+    const entry = carrierStats.get(order.carrier) || { total: 0, delayed: 0 };
+    entry.total += 1;
+    if (order.status === 'delayed') entry.delayed += 1;
+    carrierStats.set(order.carrier, entry);
+  });
+
+  const carrier_delay_rates = Array.from(carrierStats.entries())
+    .map(([carrier, value]) => ({
+      carrier,
+      total_orders: value.total,
+      delayed_orders: value.delayed,
+      delay_rate: value.total ? Number(((value.delayed / value.total) * 100).toFixed(1)) : 0
+    }))
+    .sort((a, b) => Number(b.delay_rate) - Number(a.delay_rate));
+
+  const status_breakdown = [
+    { status: 'delivered', count: delivered },
+    { status: 'delayed', count: delayed },
+    { status: 'exception', count: filtered.filter((order) => order.status === 'exception').length },
+    { status: 'in_transit', count: filtered.filter((order) => order.status === 'in_transit').length }
+  ];
+
+  return {
+    summary: {
+      total_orders: total,
+      delivered,
+      delayed,
+      on_time_rate,
+      avg_delivery_days
+    },
+    monthly_trend,
+    carrier_delay_rates,
+    status_breakdown
+  };
 }
 
 function buildDelayedByWeekResult(question: string, orders: OrderRow[]): AnalyticsResult {
@@ -255,6 +375,19 @@ function buildSummaryResult(question: string, orders: OrderRow[]): AnalyticsResu
 function buildAnalyticsResult(question: string, orders: OrderRow[]): AnalyticsResult {
   const q = question.toLowerCase();
 
+  if (!q.trim()) {
+    const dashboard = buildDashboard(orders);
+    return {
+      answer: 'Here is the current logistics overview.',
+      explanation: 'This dashboard summarizes the latest 3 months of logistics performance using CSV data.',
+      suggested_chart: 'KPI + trend chart',
+      filters: { time_range: 'last_3_months' },
+      data: dashboard.status_breakdown,
+      dashboard,
+      provider: 'csv-rule'
+    };
+  }
+
   if (/(delay|delayed|trễ|trễ hẹn|late)/i.test(q) && /(week|tuần)/i.test(q)) {
     return buildDelayedByWeekResult(question, orders);
   }
@@ -270,6 +403,50 @@ function buildAnalyticsResult(question: string, orders: OrderRow[]): AnalyticsRe
   return buildSummaryResult(question, orders);
 }
 
+async function callLlm(question: string, promptTemplate: string) {
+  const provider = DEFAULT_PROVIDER.toLowerCase();
+  const geminiKey = process.env.GEMINI_API_KEY;
+  const groqKey = process.env.GROQ_API_KEY;
+
+  if (provider === 'groq' && groqKey) {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${groqKey}`
+      },
+      body: JSON.stringify({
+        model: 'llama-3.1-8b-instant',
+        messages: [
+          { role: 'system', content: promptTemplate },
+          { role: 'user', content: question }
+        ],
+        temperature: 0.2
+      })
+    });
+
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || null;
+  }
+
+  if (provider === 'gemini' && geminiKey) {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: `${promptTemplate}\n\nUser question: ${question}` }] }]
+      })
+    });
+
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || null;
+  }
+
+  return null;
+}
+
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({ question: '' }));
   const { question } = body;
@@ -277,8 +454,38 @@ export async function POST(req: NextRequest) {
   try {
     const orders = await loadOrders();
     const result = buildAnalyticsResult(question, orders);
+    const promptTemplate = DEFAULT_PROMPT_TEMPLATE;
+    const provider = DEFAULT_PROVIDER.toLowerCase();
+    const promptSource = 'code';
 
-    return Response.json({ ok: true, provider: 'csv', result });
+    if (question && provider !== 'rule-based') {
+      const llmText = await callLlm(question, promptTemplate);
+      if (llmText) {
+        return Response.json({
+          ok: true,
+          provider,
+          result: {
+            ...result,
+            answer: llmText,
+            explanation: `${result.explanation} (LLM prompt: ${promptSource})`,
+            provider,
+            prompt_config: { provider, prompt_source: promptSource }
+          },
+          prompt_config: { provider, prompt_source: promptSource }
+        });
+      }
+    }
+
+    return Response.json({
+      ok: true,
+      provider: 'csv-rule',
+      result: {
+        ...result,
+        provider: 'csv-rule',
+        prompt_config: { provider, prompt_source: promptSource }
+      },
+      prompt_config: { provider, prompt_source: promptSource }
+    });
   } catch (error) {
     return Response.json(
       {
