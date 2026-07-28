@@ -1,6 +1,7 @@
 'use client';
 
 import { FormEvent, useEffect, useState } from 'react';
+import { LOGISTICS_TEST_CASES, type LogisticsTestCase } from './testCases';
 
 type DashboardSummary = {
   total_orders: number;
@@ -98,12 +99,51 @@ function SimpleBarChart({ data, labelKey, valueKey }: { data: Array<Record<strin
   );
 }
 
+function DynamicResultChart({ data }: { data: Array<Record<string, unknown>> }) {
+  if (!data.length) return null;
+
+  const first = data[0];
+  const metricKey = Object.keys(first).find((key) => /count|orders|rate|value|cost|amount|total|delay/i.test(key)) || Object.keys(first)[1] || 'value';
+  const labelKey = Object.keys(first).find((key) => key !== metricKey) || 'label';
+
+  return <SimpleBarChart data={data} labelKey={labelKey} valueKey={metricKey} />;
+}
+
 export default function HomePage() {
   const [question, setQuestion] = useState('Which carrier has the highest delay rate?');
   const [result, setResult] = useState<ResultData | null>(null);
   const [dashboard, setDashboard] = useState<DashboardPayload | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [activeTestId, setActiveTestId] = useState<string | null>(null);
+
+  const runQuestion = async (nextQuestion: string, testId: string | null = null) => {
+    setQuestion(nextQuestion);
+    setActiveTestId(testId);
+    setLoading(true);
+    setError('');
+    setResult(null);
+
+    try {
+      const res = await fetch('/api/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: nextQuestion })
+      });
+      const data = await res.json();
+
+      if (!data.ok) {
+        setError(data.error || 'Unknown error');
+      } else {
+        setResult(data.result || null);
+        setDashboard(data.result?.dashboard || null);
+      }
+    } catch (err) {
+      setError(`Error: ${err}`);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const loadDashboard = async () => {
     try {
@@ -128,30 +168,19 @@ export default function HomePage() {
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    setLoading(true);
-    setError('');
-    setResult(null);
-
-    try {
-      const res = await fetch('/api/query', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question })
-      });
-      const data = await res.json();
-
-      if (!data.ok) {
-        setError(data.error || 'Unknown error');
-      } else {
-        setResult(data.result || null);
-        setDashboard(data.result?.dashboard || null);
-      }
-    } catch (err) {
-      setError(`Error: ${err}`);
-    } finally {
-      setLoading(false);
-    }
+    await runQuestion(question, null);
   };
+
+  const handleRunTestCase = (testCase: LogisticsTestCase) => {
+    void runQuestion(testCase.question, testCase.id);
+  };
+
+  const activeTest = activeTestId
+    ? LOGISTICS_TEST_CASES.find((testCase) => testCase.id === activeTestId)
+    : null;
+
+  const answerMatchesExpected =
+    activeTest && result ? result.answer.trim() === activeTest.expectedAnswer.trim() : null;
 
   const summary = dashboard?.summary;
 
@@ -178,6 +207,46 @@ export default function HomePage() {
       </section>
 
       <section className="card">
+        <h2>Reliable demo test cases (English)</h2>
+        <p className="muted">
+          Ten questions with expected answers computed from <code>data/mock_logistics_data.csv</code> using the same
+          rule-based analytics as the API. Regenerate with <code>node scripts/generate-test-cases.mjs</code>.
+        </p>
+        <div className="test-case-list">
+          {LOGISTICS_TEST_CASES.map((testCase) => (
+            <article key={testCase.id} className={`test-case-item${activeTestId === testCase.id ? ' active' : ''}`}>
+              <div className="test-case-head">
+                <span className="test-case-id">{testCase.id}</span>
+                <span className="test-case-category">{testCase.category}</span>
+              </div>
+              <p className="test-case-question">{testCase.question}</p>
+              <p className="test-case-expected">
+                <strong>Expected answer:</strong> {testCase.expectedAnswer}
+              </p>
+              <button
+                type="button"
+                className="secondary"
+                disabled={loading}
+                onClick={() => handleRunTestCase(testCase)}
+              >
+                Run test case
+              </button>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      <section className="card">
+        <h2>Ask a business question</h2>
+        <form onSubmit={handleSubmit}>
+          <textarea value={question} onChange={(e) => setQuestion(e.target.value)} rows={3} />
+          <div className="actions">
+            <button type="submit" disabled={loading}>{loading ? 'Thinking...' : 'Ask'}</button>
+          </div>
+        </form>
+      </section>
+
+      <section className="card">
         <div className="grid two-col">
           <div>
             <h3>Monthly trend</h3>
@@ -193,21 +262,18 @@ export default function HomePage() {
       </section>
 
       <section className="card">
-        <h2>Ask a business question</h2>
-        <form onSubmit={handleSubmit}>
-          <textarea value={question} onChange={(e) => setQuestion(e.target.value)} rows={3} />
-          <div className="actions">
-            <button type="submit" disabled={loading}>{loading ? 'Thinking...' : 'Ask'}</button>
-          </div>
-        </form>
-      </section>
-
-      <section className="card">
         <h3>Response</h3>
         {error ? (
           <p className="error">{error}</p>
         ) : result ? (
           <div>
+            {answerMatchesExpected !== null ? (
+              <p className={answerMatchesExpected ? 'match-ok' : 'match-fail'}>
+                {answerMatchesExpected
+                  ? 'API answer matches the expected test-case answer.'
+                  : 'API answer differs from the expected test-case answer (see Expected answer in the test case list).'}
+              </p>
+            ) : null}
             <p><strong>Answer:</strong> {result.answer}</p>
             <p><strong>Explanation:</strong> {result.explanation}</p>
             <p><strong>Suggested chart:</strong> {result.suggested_chart}</p>
@@ -215,7 +281,8 @@ export default function HomePage() {
             <p><strong>Provider:</strong> {result.provider || 'csv-rule'}</p>
             {result.data && result.data.length > 0 ? (
               <div className="result-block">
-                <strong>Chart data:</strong>
+                <strong>Chart:</strong>
+                <DynamicResultChart data={result.data} />
                 <pre>{JSON.stringify(result.data, null, 2)}</pre>
               </div>
             ) : null}

@@ -10,6 +10,8 @@ type OrderRow = {
   origin_city: string;
   destination_city: string;
   order_value_usd: number;
+  region: string;
+  is_promo: string;
 };
 
 type AnalyticsResult = {
@@ -147,9 +149,29 @@ async function loadOrders(): Promise<OrderRow[]> {
       carrier: String(record.carrier || ''),
       origin_city: String(record.origin_city || ''),
       destination_city: String(record.destination_city || ''),
-      order_value_usd: Number(record.order_value_usd || 0)
+      order_value_usd: Number(record.order_value_usd || 0),
+      region: String(record.region || ''),
+      is_promo: String(record.is_promo || '0')
     };
   });
+}
+
+function getLatestOrderMonth(orders: OrderRow[]) {
+  const validDates = orders
+    .map((order) => ({ order, date: getSafeDate(order.order_date) }))
+    .filter((entry): entry is { order: OrderRow; date: Date } => Boolean(entry.date));
+
+  if (!validDates.length) return null;
+
+  const latestDate = validDates.reduce(
+    (latest, entry) => (entry.date > latest ? entry.date : latest),
+    new Date(0)
+  );
+  const monthStart = new Date(latestDate.getFullYear(), latestDate.getMonth(), 1);
+  const monthLabel = `${latestDate.getFullYear()}-${String(latestDate.getMonth() + 1).padStart(2, '0')}`;
+  const monthOrders = validDates.filter((entry) => entry.date >= monthStart).map((entry) => entry.order);
+
+  return { monthLabel, monthOrders };
 }
 
 function isVietnamese(text: string) {
@@ -348,6 +370,160 @@ function buildRouteCostResult(question: string, orders: OrderRow[]): AnalyticsRe
   };
 }
 
+function buildLastMonthDelayedResult(question: string, orders: OrderRow[]): AnalyticsResult {
+  const locale = isVietnamese(question) ? 'vi' : 'en';
+  const monthInfo = getLatestOrderMonth(orders);
+
+  if (!monthInfo) {
+    return {
+      answer: locale === 'vi' ? 'Không có dữ liệu đơn hàng hợp lệ.' : 'No valid order dates in the dataset.',
+      explanation: locale === 'vi' ? 'Không thể xác định tháng gần nhất.' : 'Unable to determine the latest calendar month.',
+      suggested_chart: 'KPI card',
+      filters: { time_range: 'latest_month', status: 'delayed' },
+      data: []
+    };
+  }
+
+  const { monthLabel, monthOrders } = monthInfo;
+  const delayed = monthOrders.filter((order) => order.status === 'delayed').length;
+
+  return {
+    answer:
+      locale === 'vi'
+        ? `Trong ${monthLabel}, có ${delayed} đơn có trạng thái "delayed" (${monthOrders.length} đơn đặt trong tháng).`
+        : `In ${monthLabel} (calendar month of the latest order in the dataset), ${delayed} orders have status "delayed" (${monthOrders.length} orders placed that month).`,
+    explanation:
+      locale === 'vi'
+        ? 'Đếm đơn có status=delayed trong tháng lịch của ngày đơn mới nhất trong CSV.'
+        : 'Counts orders with status=delayed in the calendar month of the latest order_date in the CSV.',
+    suggested_chart: 'KPI card',
+    filters: { time_range: monthLabel, status: 'delayed', metric: 'delayed_count' },
+    data: [{ month: monthLabel, delayed_orders: delayed, total_orders: monthOrders.length }]
+  };
+}
+
+function buildExceptionCountResult(question: string, orders: OrderRow[]): AnalyticsResult {
+  const locale = isVietnamese(question) ? 'vi' : 'en';
+  const filtered = getLastMonthsOrders(orders);
+  const count = filtered.filter((order) => order.status === 'exception').length;
+  const noun = count === 1 ? 'order' : 'orders';
+
+  return {
+    answer:
+      locale === 'vi'
+        ? `Trong 3 tháng gần nhất có ${count} đơn có trạng thái "exception".`
+        : `In the last 3 months there are ${count} ${noun} with status "exception".`,
+    explanation:
+      locale === 'vi'
+        ? 'Lọc theo order_date trong 3 tháng gần nhất và đếm status=exception.'
+        : 'Filters by order_date in the last 3 months and counts status=exception.',
+    suggested_chart: 'KPI card',
+    filters: { time_range: 'last_3_months', status: 'exception', metric: 'order_count' },
+    data: [{ status: 'exception', count }]
+  };
+}
+
+function buildInTransitResult(question: string, orders: OrderRow[]): AnalyticsResult {
+  const locale = isVietnamese(question) ? 'vi' : 'en';
+  const filtered = getLastMonthsOrders(orders);
+  const count = filtered.filter((order) => order.status === 'in_transit').length;
+
+  return {
+    answer:
+      locale === 'vi'
+        ? `Trong 3 tháng gần nhất có ${count} đơn đang "in_transit".`
+        : `In the last 3 months there are ${count} orders currently marked "in_transit".`,
+    explanation:
+      locale === 'vi'
+        ? 'Lọc theo order_date trong 3 tháng gần nhất và đếm status=in_transit.'
+        : 'Filters by order_date in the last 3 months and counts status=in_transit.',
+    suggested_chart: 'KPI card',
+    filters: { time_range: 'last_3_months', status: 'in_transit', metric: 'order_count' },
+    data: [{ status: 'in_transit', count }]
+  };
+}
+
+function buildAvgDeliveryResult(question: string, orders: OrderRow[]): AnalyticsResult {
+  const locale = isVietnamese(question) ? 'vi' : 'en';
+  const filtered = getLastMonthsOrders(orders);
+  const deliveryDays = filtered
+    .map((order) => {
+      const orderDate = getSafeDate(order.order_date);
+      const deliveryDate = getSafeDate(order.delivery_date);
+      if (!orderDate || !deliveryDate) return null;
+      return Math.max(0, Math.round((deliveryDate.getTime() - orderDate.getTime()) / 86400000));
+    })
+    .filter((value): value is number => value !== null);
+
+  const avg = deliveryDays.length
+    ? Number((deliveryDays.reduce((sum, value) => sum + value, 0) / deliveryDays.length).toFixed(1))
+    : 0;
+
+  return {
+    answer:
+      locale === 'vi'
+        ? `Thời gian giao trung bình trong 3 tháng gần nhất là ${avg} ngày.`
+        : `Average delivery time in the last 3 months is ${avg} days (order_date to delivery_date, orders with both dates).`,
+    explanation:
+      locale === 'vi'
+        ? 'Tính số ngày giữa order_date và delivery_date rồi lấy trung bình.'
+        : 'Computes days between order_date and delivery_date, then averages across qualifying orders.',
+    suggested_chart: 'KPI card',
+    filters: { time_range: 'last_3_months', metric: 'avg_delivery_days' },
+    data: [{ avg_delivery_days: avg, sample_size: deliveryDays.length }]
+  };
+}
+
+function buildTopRegionResult(question: string, orders: OrderRow[]): AnalyticsResult {
+  const locale = isVietnamese(question) ? 'vi' : 'en';
+  const filtered = getLastMonthsOrders(orders);
+  const regionCounts = new Map<string, number>();
+
+  filtered.forEach((order) => {
+    regionCounts.set(order.region, (regionCounts.get(order.region) || 0) + 1);
+  });
+
+  const data = Array.from(regionCounts.entries())
+    .map(([region, order_count]) => ({ region, order_count }))
+    .sort((a, b) => Number(b.order_count) - Number(a.order_count));
+
+  const top = data[0];
+
+  return {
+    answer:
+      locale === 'vi'
+        ? `Khu vực có nhiều đơn nhất trong 3 tháng gần nhất là ${top?.region || 'N/A'} với ${top?.order_count || 0} đơn.`
+        : `The region with the most orders in the last 3 months is ${top?.region || 'N/A'} with ${top?.order_count || 0} orders.`,
+    explanation:
+      locale === 'vi'
+        ? 'Nhóm theo cột region và đếm số đơn trong 3 tháng gần nhất.'
+        : 'Groups by the region column and counts orders in the last 3 months.',
+    suggested_chart: 'Bar chart',
+    filters: { time_range: 'last_3_months', dimension: 'region', metric: 'order_count' },
+    data: data.slice(0, 5)
+  };
+}
+
+function buildPromoOrdersResult(question: string, orders: OrderRow[]): AnalyticsResult {
+  const locale = isVietnamese(question) ? 'vi' : 'en';
+  const filtered = getLastMonthsOrders(orders);
+  const promo = filtered.filter((order) => order.is_promo === '1').length;
+
+  return {
+    answer:
+      locale === 'vi'
+        ? `Trong 3 tháng gần nhất, ${promo}/${filtered.length} đơn có khuyến mãi (is_promo=1).`
+        : `In the last 3 months, ${promo} of ${filtered.length} orders used a promotion (is_promo=1).`,
+    explanation:
+      locale === 'vi'
+        ? 'Đếm các đơn có is_promo=1 trong cửa sổ 3 tháng gần nhất.'
+        : 'Counts orders with is_promo=1 in the last 3 months window.',
+    suggested_chart: 'KPI card',
+    filters: { time_range: 'last_3_months', metric: 'promo_orders', is_promo: '1' },
+    data: [{ promo_orders: promo, total_orders: filtered.length }]
+  };
+}
+
 function buildSummaryResult(question: string, orders: OrderRow[]): AnalyticsResult {
   const locale = isVietnamese(question) ? 'vi' : 'en';
   const filtered = getLastMonthsOrders(orders);
@@ -392,12 +568,40 @@ function buildAnalyticsResult(question: string, orders: OrderRow[]): AnalyticsRe
     return buildDelayedByWeekResult(question, orders);
   }
 
+  if (/(last month|tháng trước|latest month)/i.test(q) && /(delay|delayed|trễ|late)/i.test(q)) {
+    return buildLastMonthDelayedResult(question, orders);
+  }
+
   if (/(carrier|hãng|shipper|vendor)/i.test(q) && /(delay|delayed|trễ|late)/i.test(q)) {
     return buildCarrierDelayResult(question, orders);
   }
 
   if (/(cost|chi phí|value|giá trị|route|tuyến)/i.test(q) && /(highest|cao nhất|top|max)/i.test(q)) {
     return buildRouteCostResult(question, orders);
+  }
+
+  if (/exception/i.test(q)) {
+    return buildExceptionCountResult(question, orders);
+  }
+
+  if (/in[- ]?transit/i.test(q)) {
+    return buildInTransitResult(question, orders);
+  }
+
+  if (/(average|avg|mean)/i.test(q) && /(delivery|deliver)/i.test(q)) {
+    return buildAvgDeliveryResult(question, orders);
+  }
+
+  if (/region/i.test(q) && /(most|highest|top|max)/i.test(q)) {
+    return buildTopRegionResult(question, orders);
+  }
+
+  if (/promo/i.test(q)) {
+    return buildPromoOrdersResult(question, orders);
+  }
+
+  if (/(summary|overview|order status|tổng quan)/i.test(q)) {
+    return buildSummaryResult(question, orders);
   }
 
   return buildSummaryResult(question, orders);
