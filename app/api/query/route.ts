@@ -1130,7 +1130,7 @@ export async function POST(req: NextRequest) {
           ? parsed!.suggested_chart.trim()
           : baseResult.suggested_chart,
         filters: (parsed!.filters && typeof parsed!.filters === 'object')
-          ? parsed!.filters as Record<string, unknown>
+          ? parsed!.filters as Record<string, string | number | boolean>
           : baseResult.filters,
         data: Array.isArray(parsed!.data) ? parsed!.data as Array<Record<string, unknown>> : baseResult.data,
         query_plan: typeof parsed!.query_plan === 'string' && parsed!.query_plan.trim()
