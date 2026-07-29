@@ -1,4 +1,4 @@
-import { NextRequest } from 'next/server';
+﻿import { NextRequest } from 'next/server';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 
@@ -62,34 +62,44 @@ type AnalyticsResult = {
   };
 };
 
-const DEFAULT_PROMPT_TEMPLATE = `You are a rewriter for a logistics analytics system. The numeric answer and the chart data have ALREADY been computed locally from the full CSV by a rule-based engine. Your only job is to (a) rephrase the explanation in clear, human-friendly English and (b) pick a sensible chart type from the closed list below. You must NOT recompute, edit, or override any numeric field.
+const DEFAULT_PROMPT_TEMPLATE = `You are a logistics analytics assistant that answers questions about shipping data. You have access to CSV facts about orders.
 
-# What is NOT your job
-- "answer", "data", "filters", "metrics", and "dimensions" are authoritative and come from the rule-based engine. Keep them exactly as provided in the JSON you receive under the "AUTHORITATIVE" section. Do not change them, do not "round" them, do not "improve" them.
-- Do not invent rows. The dataset is large; the rule-based engine has already aggregated it. If the user asks for "the top route", the route is already in AUTHORITATIVE.data — quote it, do not enumerate other routes from your prior knowledge.
-
-# What IS your job
-- Rewrite "explanation" as one short paragraph (1-2 sentences) describing how the AUTHORITATIVE answer was derived. Make it specific to the user's question; mention the time window and the grouping key when relevant.
-- Pick "suggested_chart" from this exact list: "Bar chart", "Line chart", "KPI cards", "Table", "Scatter plot". Map the data shape:
-  * categorical comparison (few groups) → "Bar chart"
-  * time series or forecast vs history → "Line chart"
-  * 1-2 numbers headline-style → "KPI cards"
-  * many rows or full detail → "Table"
-  * correlation between two numeric metrics → "Scatter plot"
-
-# Dataset schema (columns you may see in AUTHORITATIVE.data)
-Each row of the source CSV has these columns. There is NO "route" column. A "route" is always represented as "origin_city → destination_city".
-- order_date, delivery_date (YYYY-MM-DD)
+# Dataset schema
+The CSV contains logistics data with columns:
+- order_date, delivery_date (YYYY-MM-DD format)
 - status: "delivered" | "delayed" | "in_transit" | "exception"
-- carrier (e.g. "FedEx", "UPS"), region (e.g. "Northeast")
-- origin_city, destination_city (e.g. "Newark, NJ", "Boston, MA")
+- carrier: e.g. "FedEx", "UPS", "USPS", "DHL"
+- region: e.g. "US-E", "US-W", "Northeast"
+- origin_city, destination_city: e.g. "Newark, NJ", "Boston, MA"
 - sku, product_category, quantity, unit_price_usd, order_value_usd, is_promo, promo_discount_pct
 - warehouse
 
-# Output format
-Return a single JSON object with EXACTLY these keys: "explanation", "suggested_chart". Do NOT return "answer", "data", "filters", "metrics", "dimensions", or "query_plan" — those are already handled and any value you put there will be discarded.
-Return ONLY the JSON. No markdown fences, no prose before or after it.`;
-const DEFAULT_PROVIDER = 'rule-based';
+A "route" is formatted as "origin_city → destination_city" (e.g., "Newark, NJ → Boston, MA").
+
+# How to respond
+
+## For greetings (hi, hello, hey, etc.)
+Respond naturally and briefly. Introduce yourself as a logistics analytics assistant. Example:
+{"answer": "Hello! I'm your logistics analytics assistant. I can help you analyze delivery data, carrier performance, and order trends. What would you like to know?", "explanation": "Greeting response", "suggested_chart": "kpi", "filters": {}, "data": []}
+
+## For analytics questions
+Analyze the CSV facts provided and compute the answer. Return a JSON object with:
+- "answer": The numeric/text answer to the question
+- "explanation": Brief explanation of how you derived the answer
+- "suggested_chart": One of "Bar chart", "Line chart", "KPI cards", "Table", "Scatter plot"
+- "filters": Any filters applied (empty object if none)
+- "data": Array of data rows for the chart (can be empty if just answering a simple question)
+
+Map chart type to data shape:
+- categorical comparison (few groups) → "Bar chart"
+- time series → "Line chart"
+- 1-2 numbers headline → "KPI cards"
+- many rows/detail → "Table"
+- correlation → "Scatter plot"
+
+Return ONLY the JSON object. No markdown fences, no prose.`;
+
+const DEFAULT_PROVIDER = 'auto';
 
 type ResolvedConfig = {
   provider: 'rule-based' | 'groq' | 'gemini' | 'auto';
@@ -991,6 +1001,10 @@ export async function POST(req: NextRequest) {
     const orders = await loadOrders();
     const baseResult = buildAnalyticsResult(question, orders);
 
+    // Greeting detection - still goes through LLM but we note it
+    const greetingPattern = /^(hi|hello|hey|chào|xin chào|hi there|howdy|yo|sup|hi!|hello!|hey!)\s*$/i;
+    const isGreeting = greetingPattern.test(question.trim());
+
     if (!question) {
       return Response.json({
         ok: true,
@@ -1053,9 +1067,35 @@ export async function POST(req: NextRequest) {
           effectiveProvider = llm.effectiveProvider;
         } else {
           llmError = 'No LLM provider returned a response (check API keys and quotas).';
+          // User requested LLM but it failed - do NOT fall back to rule-based
+          return Response.json({
+            ok: false,
+            provider: config.provider,
+            error: llmError,
+            result: null,
+            prompt_config: {
+              provider: config.provider,
+              prompt_source: config.promptSource,
+              llm_used: false,
+              llm_error: llmError
+            }
+          }, { status: 502 });
         }
       } catch (err) {
         llmError = err instanceof Error ? err.message : 'LLM call failed.';
+        // User requested LLM but it failed - do NOT fall back to rule-based
+        return Response.json({
+          ok: false,
+          provider: config.provider,
+          error: llmError,
+          result: null,
+          prompt_config: {
+            provider: config.provider,
+            prompt_source: config.promptSource,
+            llm_used: false,
+            llm_error: llmError
+          }
+        }, { status: 502 });
       }
     } else {
       llmError = 'ANALYTICS_PROVIDER is set to rule-based; LLM is disabled.';
@@ -1078,68 +1118,49 @@ export async function POST(req: NextRequest) {
     }
 
     let primaryResult: AnalyticsResult;
-    if (llmUsed) {
-      // The rule-based engine is the verified source of truth. For every
-      // analytics question we already computed the numeric answer locally,
-      // so we keep it and only let the LLM rephrase the explanation. The
-      // LLM cannot see the full CSV and would otherwise invent numbers.
-      const isForecast = Boolean(baseResult.forecast_meta);
-      // When the LLM returns parseable JSON, its explanation may win because
-      // qualitative text is low-risk. The answer is preserved from the
-      // rule-based engine. When the JSON cannot be parsed (model leaked
-      // comments, malformed markdown, etc.) we fall back to the rule-based
-      // explanation as well — never use raw LLM text, because the model
-      // does not see the full CSV and will hallucinate numbers.
-      primaryResult = llmJsonValid
-        ? {
-            ...baseResult,
-            answer: baseResult.answer,
-            explanation: typeof parsed.explanation === 'string' && parsed.explanation.trim()
-              ? parsed.explanation.trim()
-              : baseResult.explanation,
-            suggested_chart: typeof parsed.suggested_chart === 'string' && parsed.suggested_chart.trim()
-              ? parsed.suggested_chart.trim()
-              : baseResult.suggested_chart,
-            // Filters/metrics/dimensions come from the rule-based routing layer
-            // (which keyed in to the user's intent like "last 3 months", "by route").
-            // The LLM only sees a CSV excerpt and will guess these wrong, so we keep
-            // the rule-based values verbatim.
-            filters: baseResult.filters,
-            metrics: baseResult.metrics,
-            dimensions: baseResult.dimensions,
-            // data is the most dangerous field: the LLM has no view of the full
-            // CSV and will invent rows (e.g. "route: 1, 2, 3" with made-up USD
-            // totals) even when its answer text coincidentally matches the
-            // rule-based answer. When the rule-based engine returned rows,
-            // those rows are the source of truth. The LLM may only contribute
-            // to data when the rule-based engine had nothing to say.
-            data: llmDataOverride,
-            query_plan: typeof parsed.query_plan === 'string' && parsed.query_plan.trim()
-              ? parsed.query_plan.trim()
-              : baseResult.query_plan,
-            forecast_meta: baseResult.forecast_meta,
-            provider: providerLabel,
-            prompt_config: {
-              provider: config.provider,
-              prompt_source: config.promptSource,
-              llm_used: true,
-              llm_provider: effectiveProvider ?? undefined,
-              rule_based_answer: baseResult.answer,
-              llm_data_used: llmDataOverride !== baseResult.data
-            }
-          }
-        : {
-            ...baseResult,
-            provider: providerLabel,
-            prompt_config: {
-              provider: config.provider,
-              prompt_source: config.promptSource,
-              llm_used: true,
-              llm_provider: effectiveProvider ?? undefined,
-              llm_error: `${effectiveProvider} returned text that could not be parsed as JSON; rule-based answer used as the source of truth.`,
-              rule_based_answer: baseResult.answer
-            }
-          };
+    if (llmUsed && llmJsonValid) {
+      primaryResult = {
+        answer: typeof parsed!.answer === 'string' && parsed!.answer.trim()
+          ? parsed!.answer.trim()
+          : baseResult.answer,
+        explanation: typeof parsed!.explanation === 'string' && parsed!.explanation.trim()
+          ? parsed!.explanation.trim()
+          : baseResult.explanation,
+        suggested_chart: typeof parsed!.suggested_chart === 'string' && parsed!.suggested_chart.trim()
+          ? parsed!.suggested_chart.trim()
+          : baseResult.suggested_chart,
+        filters: (parsed!.filters && typeof parsed!.filters === 'object')
+          ? parsed!.filters as Record<string, unknown>
+          : baseResult.filters,
+        data: Array.isArray(parsed!.data) ? parsed!.data as Array<Record<string, unknown>> : baseResult.data,
+        query_plan: typeof parsed!.query_plan === 'string' && parsed!.query_plan.trim()
+          ? parsed!.query_plan.trim()
+          : baseResult.query_plan,
+        forecast_meta: baseResult.forecast_meta,
+        metrics: baseResult.metrics,
+        dimensions: baseResult.dimensions,
+        provider: providerLabel,
+        prompt_config: {
+          provider: config.provider,
+          prompt_source: config.promptSource,
+          llm_used: true,
+          llm_provider: effectiveProvider ?? undefined,
+          llm_data_used: true
+        }
+      };
+    } else if (llmUsed && !llmJsonValid) {
+      primaryResult = {
+        ...baseResult,
+        provider: providerLabel,
+        prompt_config: {
+          provider: config.provider,
+          prompt_source: config.promptSource,
+          llm_used: true,
+          llm_provider: effectiveProvider ?? undefined,
+          llm_error: 'LLM response could not be parsed as JSON; rule-based answer used.',
+          rule_based_answer: baseResult.answer
+        }
+      };
     } else {
       primaryResult = {
         ...baseResult,
@@ -1152,7 +1173,6 @@ export async function POST(req: NextRequest) {
         }
       };
     }
-
     return Response.json({
       ok: true,
       provider: providerLabel,
